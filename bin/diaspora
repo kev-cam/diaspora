@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""diaspora launcher: runs from a source checkout or an installed copy."""
+import os
+import sys
+
+here = os.path.dirname(os.path.realpath(__file__))
+for lib in (os.path.join(here, ".."), os.path.join(here, "..", "share", "diaspora")):
+    if os.path.isdir(os.path.join(lib, "diaspora")):
+        sys.path.insert(0, os.path.normpath(lib))
+        break
+
+from diaspora.cli import main  # noqa: E402
+
+sys.exit(main())
