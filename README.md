@@ -99,7 +99,9 @@ offer).
 Nothing reaches your branch untested, and nothing is ever pushed.
 
 If a required test fails *without* the import, diaspora says so and stops:
-no import can be validated against a broken baseline.
+no import can be validated against a broken baseline. A regression suite
+that has failures of its own is handled differently: the gate is then that
+the import adds no failure (see [below](#a-suite-that-already-has-failures)).
 
 ## diaspora.conf
 
@@ -124,17 +126,21 @@ key adds to a list (`run` lines are joined with `&&`).
 	run = mkdir -p "$DIASPORA_BUILD" && cd "$DIASPORA_BUILD"
 	run = { [ -f Makefile ] || "$DIASPORA_SRC/configure"; } && make -j"$(nproc)"
 
-[test "regress"]
+[test "full-regression"]
 	needs = compile
 	run = make -C "$DIASPORA_BUILD" check
 	timeout = 3h
 
 [require]
-	default = regress
+	default = full-regression
 	docs = none
 ```
 
-Complete examples for nvc and Xyce are in [`examples/`](examples).
+[`examples/`](examples) has the `diaspora.conf` of two real forks, nvc and
+Xyce. In both the full regression is the gate for every kind of change, and
+since their suites have failures of their own, it is a
+[no-new-failures](#a-suite-that-already-has-failures) gate fed by a
+regression harness.
 
 ### `[diaspora]`
 
@@ -185,23 +191,61 @@ optional. Commands run in the import workspace with:
 | `DIASPORA_BUILD` | a build directory kept between runs |
 | `DIASPORA_REPO` | your checkout |
 | `DIASPORA_PEER`, `DIASPORA_COMMIT` | what is being imported |
+| `DIASPORA_FAILURES` | where a `pass = no-new-failures` level lists the failing tests |
+
+A level tests whatever its command builds, so the build has to pick up
+everything an import can change: generated sources, a new file in the
+build system, a changed configure script. A stale build passes anything.
+(nvc's `configure`, for one, turns maintainer mode off in a git worktree,
+after which make no longer regenerates its lexers;
+[`examples/nvc.diaspora.conf`](examples/nvc.diaspora.conf) shows the way
+round it.)
 
 `[require]` says which level an import must pass, by kind of change:
 
 ```ini
 [require]
-	default = regress
+	default = full-regression
 	docs = none
 	test = unit
 
 [require "nickg"]
-	feature = regress
+	feature = full-regression
 ```
 
-Everything passes `regress` except documentation (no testing) and
+Everything passes `full-regression` except documentation (no testing) and
 test-only changes (`unit`); the second section is stricter or looser for
 one peer. The most specific line wins: the peer's kind, the kind, the
-peer's default (`test =` in its `[peer]` section), the default.
+peer's default (`test =` in its `[peer]` section), the default. With just
+`default = full-regression`, the full regression is the gate for
+everything.
+
+#### A suite that already has failures
+
+A regression in which some tests fail on your own branch cannot be a gate
+by exit status. Such a level compares instead:
+
+```ini
+[test "full-regression"]
+	needs = compile
+	run = ./run-suite --failures-to "$DIASPORA_FAILURES"
+	pass = no-new-failures
+	retry = 1
+```
+
+The command runs the suite and writes the names of the failing tests, one
+per line, to the file `$DIASPORA_FAILURES`; it exits 0 if the suite ran at
+all. The level passes when no test fails that did not already fail on the
+code before the import.
+
+That reference is measured by running the same level on the code before
+the import. It is kept in `.git/diaspora/results/`, per source tree, and
+what a passing import measured is the reference for the next one, so in
+the steady state an import costs one run of the suite. A reference older
+than `reference-age` (default `1d`; `0` never expires) is measured again,
+because the tools around the suite move too. With `retry`, a new failure
+counts only if it fails again. `diaspora test full-regression` measures
+the reference for your branch ahead of time.
 
 ### `[divergence]`
 
@@ -299,7 +343,7 @@ agent or you ported it.
 decision:
 
 ```json
-{"commit": "df04425a0c...", "date": "2026-11-17", "dir": "import", "kind": "bugfix", "peer": "nickg", "subject": "Handle empty named port connections", "tests": ["compile", "unit", "regress"], "verdict": "adapted"}
+{"commit": "df04425a0c...", "date": "2026-11-17", "dir": "import", "kind": "bugfix", "peer": "nickg", "subject": "Handle empty named port connections", "tests": ["compile", "full-regression"], "verdict": "adapted"}
 ```
 
 | verdict | |
@@ -388,17 +432,17 @@ Version 0.1.
 - `make check` (tests on scratch repositories, with a stand-in agent)
   covers scanning and policy; clean, conflicting and failing imports;
   agent porting and repair; stopping for a person and continuing, through
-  a real terminal; batch testing; a broken baseline; a target branch that
-  moves; both workspace kinds; verdicts; export.
+  a real terminal; batch testing; a broken baseline; suites with standing
+  failures; a target branch that moves; both workspace kinds; verdicts;
+  export.
 - Tried on a clone of kev-cam/nvc with nickg/nvc as the peer and Claude as
   the agent: the scan of 644 candidate commits takes about 3 seconds;
   agent triage of 40 commits took 34 seconds; two of Nick's fixes that
-  conflicted with the fork were ported by the agent, passed the `compile`
-  level and landed with their trailers and ledger entries. The `unit` and
-  `regress` levels of [`examples/nvc.diaspora.conf`](examples/nvc.diaspora.conf)
-  were not run in that trial, and
-  [`examples/xyce.diaspora.conf`](examples/xyce.diaspora.conf) has not
-  been run at all (its regression command is a placeholder).
+  conflicted with the fork were ported by the agent, passed a `compile`
+  level and landed with their trailers and ledger entries.
+- kev-cam/nvc and kev-cam/xyce carry the `diaspora.conf` files in
+  [`examples/`](examples), with the full regression as the gate; what has
+  been run with them is in the commit messages there.
 
 Not there yet: several branches per peer, agent triage for exports (the
 export list is by message and by whether the peer has the files),

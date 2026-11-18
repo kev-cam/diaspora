@@ -541,12 +541,16 @@ def cmd_init(repo, ui, args):
     else:
         build, check = "true  # how to compile", "true  # how to test"
     tests = ('[test "compile"]\n\trun = %s\n'
-             '[test "regression"]\n\tneeds = compile\n\trun = %s\n'
-             '\ttimeout = 2h\n' % (build, check))
+             '[test "full-regression"]\n\tneeds = compile\n\trun = %s\n'
+             '\ttimeout = 2h\n'
+             '# If the suite has failing tests on your own branch, have the '
+             'command list\n# them in "$DIASPORA_FAILURES" and gate on '
+             '"none new":\n#\tpass = no-new-failures\n' % (build, check))
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(TEMPLATE.format(
             target=repo.current_branch() or "main", kinds=" ".join(KINDS),
-            peers="\n".join(peers), tests=tests, default="regression"))
+            peers="\n".join(peers), tests=tests,
+            default="full-regression"))
     exclude = os.path.join(repo.common, "info", "exclude")
     try:
         os.makedirs(os.path.dirname(exclude), exist_ok=True)

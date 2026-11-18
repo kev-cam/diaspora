@@ -21,7 +21,7 @@ DOCS = PathSet(["*.md", "*.rst", "*.adoc", "*.texi", "*.1", "doc/", "docs/",
                 "CONTRIBUTING*", "LICENSE*", "COPYING*"])
 CI = PathSet([".github/", ".gitlab-ci.yml", ".travis.yml", ".circleci/",
               "appveyor.yml", ".cirrus.yml", "azure-pipelines.yml", "ci/",
-              ".gitlab/"])
+              ".gitlab/", "gitlab-ci/", "Jenkinsfile"])
 TESTS = PathSet(["test/", "tests/", "t/", "testsuite/", "regress/",
                  "**/test/**", "**/tests/**", "*_test.*", "test_*.*"])
 BUILD = PathSet(["Makefile", "Makefile.*", "GNUmakefile", "*.mk", "*.am",

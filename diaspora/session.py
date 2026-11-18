@@ -77,7 +77,7 @@ required test level "{level}" failed.  The same level passes without the
 import.
 
 Test command: {command}
-End of the log ({log}):
+{detail}End of the log ({log}):
 ---
 {tail}
 ---
@@ -422,7 +422,7 @@ class Session:
         """Does `level` pass right before this import?  Blocked if not."""
         ws = self.ws
         before = self.repo.git("rev-parse", item["head0"] + "^{tree}")
-        if (before, level) in self.tester.passed:
+        if (before, level) in self.tester.verified:
             return
         self.ui.step("checking that %s passes without this import ..."
                      % level)
@@ -438,6 +438,25 @@ class Session:
                 "import can be validated.  Log: %s" % (
                     failed, item["head0"][:10], log))
 
+    def _reference(self, sha, level):
+        """What fails in `level` on commit `sha`, the code before an import."""
+        found = self.tester.load(sha, level)
+        if found is not None:
+            return found
+        self.ui.step("measuring %s on %s, before the import ..." % (
+            level, sha[:10]))
+        self.ws.git("checkout", "--quiet", "--detach", sha)
+        try:
+            ok, failed, log = self.tester.run([level], "reference")
+        finally:
+            self.ws.git("checkout", "--quiet", self.data["branch"])
+        if not ok:
+            raise Blocked(
+                "test level %s does not run on the code before the import "
+                "(at %s), so no import can be validated.  Log: %s" % (
+                    failed, sha[:10], log))
+        return self.tester.load(sha, level) or set()
+
     def _test_item(self, item):
         levels = self._levels(item)
         if not levels:
@@ -449,24 +468,33 @@ class Session:
             else 0
         tag = "%s-%s" % (item["peer"], item["sha"][:10])
         while True:
-            ok, level, log = self.tester.run(levels, tag, self._env(item))
+            ok, level, log = self.tester.run(
+                levels, tag, self._env(item),
+                lambda name: self._reference(item["head0"], name))
             if ok:
                 item["state"] = "done"
                 item["tests"] = self.conf.chain(levels)
                 return
-            self._baseline(item, level)
+            detail = self.tester.detail
+            if not self.tester.compared:
+                self._baseline(item, level)
             if attempts > 0:
                 attempts -= 1
-                if self._fix(item, level, log):
+                if self._fix(item, level, log, detail):
                     continue
-            self._fail(item, "test %s failed (log: %s)" % (level, log))
+            self._fail(item, "test %s failed%s (log: %s)" % (
+                level, ", " + detail if detail else "", log))
             return
 
-    def _fix(self, item, level, log):
+    def _fix(self, item, level, log, detail=""):
         prompt = FIX_PROMPT.format(
             ws=self.ws.path, sha=item["sha"], subject=item["subject"],
             source=item["peer"], level=level,
-            command=self.conf.tests[level].run, log=log, tail=tail(log))
+            command=self.conf.tests[level].run, log=log, tail=tail(log),
+            detail="Tests that pass without the import and fail with it: "
+                   "%s (full list: %s).  Tests that failed before are not "
+                   "your concern.\n" % (detail, log[:-4] + ".new-failures")
+            if detail else "")
         self.ui.step("agent: looking at the %s failure ..." % level)
         answer = self.agent.ask("fix", prompt, FIX_SCHEMA, cwd=self.ws.path)
         if not answer:
@@ -501,7 +529,9 @@ class Session:
         if levels:
             self.ui.say("Testing %d import%s together ..." % (
                 len(picked), "" if len(picked) == 1 else "s"))
-            ok, level, log = self.tester.run(levels, "batch")
+            ok, level, log = self.tester.run(
+                levels, "batch", None,
+                lambda name: self._reference(picked[0]["head0"], name))
         else:
             ok = True
         if ok:
@@ -711,7 +741,10 @@ class Session:
             if item["state"] == "done":
                 levels += [lv for lv in self._levels(item)
                            if lv not in levels]
-        ok, level, log = self.tester.run(levels, "rebased") if levels \
+        tip = self.repo.rev(data["target"])
+        ok, level, log = self.tester.run(
+            levels, "rebased", None,
+            lambda name: self._reference(tip, name)) if levels \
             else (True, None, None)
         if data["ledger_commit"]:
             self._commit_ledger(data["entries"])

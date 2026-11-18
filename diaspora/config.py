@@ -86,6 +86,15 @@ class TestLevel:
     needs: list = field(default_factory=list)
     timeout: float = None
     retry: int = 0
+    # "exit": the command's exit status decides.  "no-new-failures": the
+    # command lists the failing tests in $DIASPORA_FAILURES and the level
+    # passes when none fails that did not already fail before the import.
+    mode: str = "exit"
+    reference_age: float = 86400.0   # how long a measured reference is good
+
+    @property
+    def compares(self):
+        return self.mode == "no-new-failures"
 
 
 @dataclass
@@ -246,12 +255,19 @@ class Config:
             if not runs:
                 self._err('[test "%s"] has no run command' % name)
             timeout = one("test", name, "timeout")
+            mode = one("test", name, "pass", "exit")
+            if mode not in ("exit", "no-new-failures"):
+                self._err('[test "%s"] pass must be exit or no-new-failures'
+                          % name)
             self.tests[name] = TestLevel(
                 name=name, run=" && ".join(runs),
                 needs=words("test", name, "needs"),
                 timeout=parse_duration(timeout, "test.%s.timeout" % name)
                 if timeout else None,
-                retry=int(one("test", name, "retry", "0")))
+                retry=int(one("test", name, "retry", "0")), mode=mode,
+                reference_age=parse_duration(
+                    one("test", name, "reference-age", "1d"),
+                    "test.%s.reference-age" % name))
         for level in self.tests.values():
             for need in level.needs:
                 if need not in self.tests:

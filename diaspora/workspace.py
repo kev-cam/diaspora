@@ -8,12 +8,14 @@ instead (it must be clean), which reuses the build tree you already have.
 """
 
 import hashlib
+import json
 import os
 import signal
 import subprocess
 import threading
 import time
 
+from .config import CONF_NAME, LOCAL_NAME
 from .gitutil import DiasporaError
 
 
@@ -106,7 +108,14 @@ def fmt_secs(secs):
 
 
 class Tester:
-    """Runs test levels in the workspace; remembers what passed where."""
+    """Runs test levels in the workspace; remembers what passed where.
+
+    A level either passes by exit status, or (pass = no-new-failures) it
+    reports the tests that fail and passes when none of them is new: the
+    failures are compared with those of the same level on the code before
+    the import (the reference), which is measured once and kept in
+    .git/diaspora/results.
+    """
 
     def __init__(self, conf, workspace, log_dir, say, verbose=False):
         self.conf = conf
@@ -114,34 +123,77 @@ class Tester:
         self.log_dir = log_dir
         self.say = say
         self.verbose = verbose
-        self.passed = set()             # (tree, level)
+        self.verified = set()     # (tree, level): known to pass on that tree
+        self.current = None       # the tree the build directory holds
+        self.compared = False     # the last failure was new failing tests
+        self.detail = ""          # ... and which
+        self.meta = {CONF_NAME, LOCAL_NAME, conf.ledger}
 
-    def run_level(self, name, tag, env=None):
-        """Run one level; return (ok, log path)."""
+    # -- measured failures ----------------------------------------------------
+    def key(self, rev="HEAD"):
+        """Identifies a source tree, ignoring diaspora's own files."""
+        lines = [line for line in self.ws.repo.git(
+            "ls-tree", "-r", rev, cwd=self.ws.path).splitlines()
+            if line.partition("\t")[2] not in self.meta]
+        return hashlib.sha1("\n".join(lines).encode()).hexdigest()
+
+    def _result_file(self, rev, name):
+        return os.path.join(self.ws.repo.state_dir("results", name),
+                            self.key(rev) + ".json")
+
+    def store(self, rev, name, failures):
+        with open(self._result_file(rev, name), "w",
+                  encoding="utf-8") as handle:
+            json.dump({"command": self.conf.tests[name].run,
+                       "time": time.time(), "failures": sorted(failures)},
+                      handle, indent=0)
+
+    def load(self, rev, name):
+        """Failures measured earlier for this tree, or None."""
+        level = self.conf.tests[name]
+        try:
+            with open(self._result_file(rev, name),
+                      encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            return None
+        if data.get("command") != level.run:
+            return None
+        if level.reference_age and \
+                time.time() - data.get("time", 0) > level.reference_age:
+            return None
+        return set(data.get("failures", []))
+
+    # -- running --------------------------------------------------------------
+    def _attempt(self, name, tag, env, again):
+        """Run the level's command once: (ok, why not, failures, log)."""
         level = self.conf.tests[name]
         os.makedirs(self.log_dir, exist_ok=True)
         log = os.path.join(self.log_dir, "%s-%s.log" % (tag, name))
+        listing = log[:-4] + ".failures"
+        if os.path.exists(listing):
+            os.remove(listing)
         full_env = dict(os.environ)
         full_env.update({
             "DIASPORA_SRC": self.ws.path, "DIASPORA_REPO": self.ws.repo.top,
-            "DIASPORA_BUILD": self.ws.build or "", "DIASPORA_LEVEL": name})
+            "DIASPORA_BUILD": self.ws.build or "", "DIASPORA_LEVEL": name,
+            "DIASPORA_FAILURES": listing})
         full_env.update(env or {})
-        for attempt in range(level.retry + 1):
-            start = time.time()
-            ok, why = self._run(level, log, full_env, attempt)
-            took = fmt_secs(time.time() - start)
-            if ok:
-                self.say("test %s: ok (%s)" % (name, took))
-                return True, log
-            again = attempt < level.retry
-            self.say("test %s: FAILED (%s%s)%s" % (
-                name, took, ", " + why if why else "",
-                " - retrying" if again else ""))
-        return False, log
+        ok, why = self._exec(level, log, full_env, again)
+        failures = None
+        if ok and level.compares:
+            try:
+                with open(listing, encoding="utf-8",
+                          errors="replace") as handle:
+                    failures = {line.strip() for line in handle
+                                if line.strip()}
+            except OSError:
+                ok, why = False, "the command did not write $DIASPORA_FAILURES"
+        return ok, why, failures, log
 
-    def _run(self, level, log, env, attempt):
-        timed_out = []
-        with open(log, "a" if attempt else "w", encoding="utf-8",
+    def _exec(self, level, log, env, again):
+        timed_out = False
+        with open(log, "a" if again else "w", encoding="utf-8",
                   errors="replace") as out:
             out.write("### %s: %s\n### in %s\n" % (level.name, level.run,
                                                    self.ws.path))
@@ -152,42 +204,101 @@ class Tester:
                 stderr=subprocess.STDOUT, start_new_session=True, text=True,
                 errors="replace")
 
-            def kill():
-                timed_out.append(True)
+            def pump():
                 try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except OSError:
-                    pass
-
-            timer = None
-            if level.timeout:
-                timer = threading.Timer(level.timeout, kill)
-                timer.start()
-            try:
-                with proc.stdout:
                     for line in proc.stdout:
                         out.write(line)
                         if self.verbose:
                             print("      | " + line, end="")
+                except ValueError:      # the log was closed under us
+                    pass
+
+            # The output is read on the side: a build tool may leave helper
+            # processes behind that keep the pipe open after the command
+            # itself has ended, and the level must not wait for those.
+            reader = threading.Thread(target=pump, daemon=True)
+            reader.start()
+            try:
+                proc.wait(timeout=level.timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
                 proc.wait()
-            finally:
-                if timer:
-                    timer.cancel()
+            reader.join(10)
             out.write("### exit %d\n" % proc.returncode)
         if timed_out:
             return False, "timed out after %s" % fmt_secs(level.timeout)
         return proc.returncode == 0, "exit %d" % proc.returncode
 
-    def run(self, levels, tag, env=None):
-        """Run levels and what they need; return (ok, failed level, log)."""
+    def _level(self, name, tag, env, tree, reference):
+        """Run one level with its retries; return (ok, log)."""
+        level = self.conf.tests[name]
+        new = None                 # failures that are new in every attempt
+        for attempt in range(level.retry + 1):
+            start = time.time()
+            ok, why, failures, log = self._attempt(name, tag, env, attempt)
+            took = fmt_secs(time.time() - start)
+            note = ""
+            if ok and level.compares:
+                self.store("HEAD", name, failures)
+                note = ", %d failing" % len(failures)
+                if reference is not None:
+                    fresh = failures - reference
+                    new = fresh if new is None else new & fresh
+                    ok = not new
+                    why = "%d new failure%s" % (len(new),
+                                                "" if len(new) == 1 else "s")
+                    note += ", none new" if ok else ""
+                else:
+                    note += ", recorded"
+            if ok:
+                self.say("test %s: ok (%s%s)" % (name, took, note))
+                return True, log
+            self.say("test %s: FAILED (%s, %s)%s" % (
+                name, took, why,
+                " - retrying" if attempt < level.retry else ""))
+        if new:
+            names = sorted(new)
+            self.compared = True
+            self.detail = "%d new failure%s: %s%s" % (
+                len(names), "" if len(names) == 1 else "s",
+                ", ".join(names[:8]), " ..." if len(names) > 8 else "")
+            with open(log[:-4] + ".new-failures", "w",
+                      encoding="utf-8") as handle:
+                handle.write("\n".join(names) + "\n")
+        return False, log
+
+    def run(self, levels, tag, env=None, reference=None):
+        """Run levels and what they need; return (ok, failed level, log).
+
+        `reference(level)` gives the failures of a comparing level on the
+        code before the import.  Without it such a level only has to run,
+        and what it reports is recorded.
+        """
         tree = self.ws.tree()
-        for name in self.conf.chain(levels):
-            if (tree, name) in self.passed:
-                continue
-            ok, log = self.run_level(name, tag, env)
+        chain = self.conf.chain(levels)
+        todo = [n for n in chain if (tree, n) not in self.verified]
+        if not todo:
+            return True, None, None
+        # references first: measuring one takes the workspace and the build
+        # directory to another tree
+        refs = {}
+        if reference:
+            for name in todo:
+                if self.conf.tests[name].compares:
+                    refs[name] = reference(name)
+        if self.current != tree:
+            todo = chain          # the build directory holds another tree
+        self.current = tree
+        self.compared, self.detail = False, ""
+        for name in todo:
+            ok, log = self._level(name, tag, env, tree, refs.get(name))
             if not ok:
                 return False, name, log
-            self.passed.add((tree, name))
+            self.verified.add((tree, name))
         return True, None, None
 
 

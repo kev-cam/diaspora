@@ -293,7 +293,7 @@ class ConfigTests(World):
         self.assertEqual(conf.peer("upstream").url, self.peer)
         self.assertEqual(conf.target, "main")
         self.assertEqual(conf.levels_for("upstream", "bugfix"),
-                         ["regression"])
+                         ["full-regression"])
         self.run_cli("init", code=1)
 
 
@@ -628,6 +628,18 @@ class ImportTests(World):
             % (flag, flag))
         out = self.run_cli("test", "slow", code=1)
         self.assertIn("timed out after 1s", out)
+        # a helper process left behind with the output open does not hold
+        # the level up
+        self.local_conf('[test "leaky"]\n'
+                        '\trun = (setsid sleep 60 &) ; echo done\n')
+        import time
+        start = time.time()
+        self.run_cli("test", "leaky", code=0)
+        self.assertLess(time.time() - start, 30)
+        self.local_conf(
+            '[test "flaky"]\n\trun = test -f %s || { touch %s; false; }\n'
+            '\tretry = 1\n[diaspora]\n\tledger = meta/ledger.jsonl\n'
+            % (flag, flag))
         out = self.run_cli("test", "flaky", code=0)
         self.assertIn("retrying", out)
         self.run_cli("fetch", code=0)
@@ -655,6 +667,88 @@ class ImportTests(World):
         self.assertIn("No run in progress", out)
         self.run_cli("test", "compile", code=0)
         self.assertIn("All passed", self.last_out)
+
+
+class NoNewFailuresTests(World):
+    """A suite with standing failures: the gate is "no new failures"."""
+
+    def setUp(self):
+        super().setUp()
+        self.count = os.path.join(self.tmp, "count")
+        self.commit(self.ours, "A breakage we live with", {
+            "src/old.c": "BROKEN\n"})
+        self.pb = self.commit(self.peer, "Fix e handling", {
+            "src/e.c": "BROKEN\n"})
+        self.suite('grep -l BROKEN src/*.c > "$DIASPORA_FAILURES"; true')
+
+    def suite(self, command, extra=""):
+        self.local_conf(
+            '[test "suite"]\n\tneeds = compile\n'
+            '\trun = echo run >> %s; %s\n\tpass = no-new-failures\n%s'
+            '[require]\n\tdefault = suite\n' % (self.count, command, extra))
+
+    def runs(self):
+        with open(self.count) as handle:
+            return len(handle.readlines())
+
+    def test_standing_failures_do_not_block(self):
+        out = self.run_cli("import", "--yes", "--pick", self.p1,
+                           "--pick", self.pb, code=4)
+        ledger = self.ledger()
+        self.assertEqual(ledger[self.p1]["verdict"], "applied")
+        self.assertEqual(ledger[self.p1]["tests"], ["compile", "suite"])
+        self.assertEqual(ledger[self.pb]["verdict"], "failed")
+        self.assertIn("1 new failure: src/e.c", ledger[self.pb]["note"])
+        self.assertEqual(out.count("measuring suite on"), 1)
+        self.assertIn("1 failing, none new", out)
+        # the target before, the first import, the second import
+        self.assertEqual(self.runs(), 3)
+        # next run: what the last good import measured is the reference
+        self.run_cli("import", "--yes", "--pick", self.p3, code=0)
+        self.assertNotIn("measuring suite on", self.last_out)
+        self.assertEqual(self.runs(), 4)
+
+    def test_diaspora_test_records_the_reference(self):
+        out = self.run_cli("test", "suite", code=0)
+        self.assertIn("1 failing, recorded", out)
+        self.run_cli("import", "--yes", "--pick", self.p1, code=0)
+        self.assertNotIn("measuring suite on", self.last_out)
+        self.assertEqual(self.runs(), 2)
+
+    def test_flaky_failure_is_retried(self):
+        # the second run of the suite (the import's first) has a failure
+        # that does not come back
+        self.suite('{ [ "$(wc -l < %s)" = 2 ] && echo flaky; '
+                   'grep -l BROKEN src/*.c; } > "$DIASPORA_FAILURES"; true'
+                   % self.count, "\tretry = 1\n")
+        out = self.run_cli("import", "--yes", "--pick", self.p1, code=0)
+        self.assertIn("1 new failure) - retrying", out)
+        self.assertEqual(self.ledger()[self.p1]["verdict"], "applied")
+        self.assertEqual(self.runs(), 3)
+
+    def test_the_suite_must_report(self):
+        self.suite("true")
+        self.run_cli("test", "suite", code=1)
+        self.assertIn("did not write $DIASPORA_FAILURES", self.last_out)
+
+    def test_a_suite_that_cannot_run_blocks(self):
+        self.suite("false")
+        self.run_cli("import", "--yes", "--pick", self.p1, code=3)
+        self.assertIn("does not run on the code before the import",
+                      self.last_err)
+        self.run_cli("abort", code=0)
+
+    def test_batch_compares_with_the_target(self):
+        self.run_cli("import", "--yes", "--strategy", "batch",
+                     "--pick", self.p1, "--pick", self.pb, code=4)
+        ledger = self.ledger()
+        self.assertEqual(ledger[self.p1]["verdict"], "applied")
+        self.assertEqual(ledger[self.pb]["verdict"], "failed")
+
+    def test_bad_mode(self):
+        self.local_conf('[test "compile"]\n\tpass = maybe\n')
+        with self.assertRaises(DiasporaError):
+            Config.load(Repo(self.ours))
 
 
 class TerminalTests(World):
