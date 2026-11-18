@@ -124,6 +124,7 @@ class Session:
         self.ws = Workspace(repo, conf)
         self.data = None
         self.tester = None
+        self._remeasured = set()     # (commit, level) references run again
 
     # -- persistence ----------------------------------------------------------
     def exists(self):
@@ -438,18 +439,30 @@ class Session:
                 "import can be validated.  Log: %s" % (
                     failed, item["head0"][:10], log))
 
-    def _reference(self, sha, level):
-        """What fails in `level` on commit `sha`, the code before an import."""
+    def _reference(self, sha, level, again=False):
+        """What fails in `level` on commit `sha`, the code before an import.
+
+        `again` measures it once more (once per run): an import is about to
+        be blamed for failures that the stored measurement does not have.
+        """
         found = self.tester.load(sha, level)
-        if found is not None:
+        if again and (sha, level) in self._remeasured:
+            again = False
+        if found is not None and not again:
             return found
-        self.ui.step("measuring %s on %s, before the import ..." % (
-            level, sha[:10]))
+        if again:
+            self._remeasured.add((sha, level))
+            self.ui.step("measuring %s on %s again: do they fail there "
+                         "too? ..." % (level, sha[:10]))
+        else:
+            self.ui.step("measuring %s on %s, before the import ..." % (
+                level, sha[:10]))
         # (--force: the build may have changed tracked files; they are build
         # products here, the import itself is committed)
         self.ws.git("checkout", "--quiet", "--force", "--detach", sha)
         try:
-            ok, failed, log = self.tester.run([level], "reference")
+            ok, failed, log = self.tester.run([level], "reference",
+                                              force=again)
         finally:
             self.ws.git("checkout", "--quiet", "--force", self.data["branch"])
         if not ok:
@@ -472,7 +485,8 @@ class Session:
         while True:
             ok, level, log = self.tester.run(
                 levels, tag, self._env(item),
-                lambda name: self._reference(item["head0"], name))
+                lambda name: self._reference(item["head0"], name),
+                lambda name: self._reference(item["head0"], name, True))
             if ok:
                 item["state"] = "done"
                 item["tests"] = self.conf.chain(levels)
@@ -539,7 +553,8 @@ class Session:
                 len(picked), "" if len(picked) == 1 else "s"))
             ok, level, log = self.tester.run(
                 levels, "batch", None,
-                lambda name: self._reference(picked[0]["head0"], name))
+                lambda name: self._reference(picked[0]["head0"], name),
+                lambda name: self._reference(picked[0]["head0"], name, True))
         else:
             ok = True
         if ok:
@@ -752,7 +767,8 @@ class Session:
         tip = self.repo.rev(data["target"])
         ok, level, log = self.tester.run(
             levels, "rebased", None,
-            lambda name: self._reference(tip, name)) if levels \
+            lambda name: self._reference(tip, name),
+            lambda name: self._reference(tip, name, True)) if levels \
             else (True, None, None)
         if data["ledger_commit"]:
             self._commit_ledger(data["entries"])

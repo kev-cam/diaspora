@@ -249,9 +249,16 @@ the import. It is kept in `.git/diaspora/results/`, per source tree, and
 what a passing import measured is the reference for the next one, so in
 the steady state an import costs one run of the suite. A reference older
 than `reference-age` (default `1d`; `0` never expires) is measured again,
-because the tools around the suite move too. With `retry`, a new failure
-counts only if it fails again. `diaspora test full-regression` measures
-the reference for your branch ahead of time.
+because the tools around the suite move too. `diaspora test
+full-regression` measures the reference for your branch ahead of time.
+
+Suites have tests that come and go. An import is blamed for a failure
+only if it stands up to two checks: the code *without* the import is
+measured once more (the failure may simply have been absent from the one
+run that made the reference; measurements of a tree add up, a test that
+failed there once counts as failing there), and with `retry` the import
+itself is run again and the failure has to come back. So a refused import
+costs up to two extra runs of the suite; a passing one costs none.
 
 ### `[divergence]`
 

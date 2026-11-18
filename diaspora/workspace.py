@@ -142,6 +142,13 @@ class Tester:
                             self.key(rev) + ".json")
 
     def store(self, rev, name, failures):
+        """Record what failed on this tree.
+
+        Measurements of one tree add up: a test that fails in one run and
+        passes in the next is a test that fails there, as far as blaming
+        an import for it goes.
+        """
+        failures = set(failures) | (self.load(rev, name) or set())
         with open(self._result_file(rev, name), "w",
                   encoding="utf-8") as handle:
             json.dump({"command": self.conf.tests[name].run,
@@ -235,11 +242,32 @@ class Tester:
             return False, "timed out after %s" % fmt_secs(level.timeout)
         return proc.returncode == 0, "exit %d" % proc.returncode
 
-    def _level(self, name, tag, env, tree, reference):
+    def _ready(self, chain, name, tag, env, tree):
+        """Have the build directory hold `tree` before level `name` runs.
+
+        Measuring a reference takes the workspace and the build to another
+        tree; the levels before `name` that build are then run again.
+        """
+        if self.current != tree:
+            for earlier in chain[:chain.index(name)]:
+                if not self.conf.tests[earlier].compares:
+                    ok, log = self._level(earlier, tag, env, tree, None)
+                    if not ok:
+                        return False, log
+            self.current = tree
+        return True, None
+
+    def _level(self, name, tag, env, tree, reference, recheck=None,
+               ready=None):
         """Run one level with its retries; return (ok, log)."""
         level = self.conf.tests[name]
         new = None                 # failures that are new in every attempt
-        for attempt in range(level.retry + 1):
+        attempt = 0
+        while True:
+            if ready:
+                ok, log = ready()
+                if not ok:
+                    return False, log
             start = time.time()
             ok, why, failures, log = self._attempt(name, tag, env, attempt)
             took = fmt_secs(time.time() - start)
@@ -250,6 +278,21 @@ class Tester:
                 if reference is not None:
                     fresh = failures - reference
                     new = fresh if new is None else new & fresh
+                    if new and recheck is not None:
+                        # Before the import is blamed: do they fail without
+                        # it, now?  The reference is one earlier run, and a
+                        # test that comes and goes may have passed in it.
+                        self.say("test %s: %d failure%s not in the "
+                                 "reference (%s)" % (
+                                     name, len(new),
+                                     "" if len(new) == 1 else "s", took))
+                        reference = reference | recheck(name)
+                        recheck = None
+                        cleared = len(new) - len(new - reference)
+                        new -= reference
+                        if cleared:
+                            note += ", %d also fail%s without the import" % (
+                                cleared, "s" if cleared == 1 else "")
                     ok = not new
                     why = "%d new failure%s" % (len(new),
                                                 "" if len(new) == 1 else "s")
@@ -259,9 +302,12 @@ class Tester:
             if ok:
                 self.say("test %s: ok (%s%s)" % (name, took, note))
                 return True, log
+            again = attempt < level.retry
             self.say("test %s: FAILED (%s, %s)%s" % (
-                name, took, why,
-                " - retrying" if attempt < level.retry else ""))
+                name, took, why, " - retrying" if again else ""))
+            if not again:
+                break
+            attempt += 1
         if new:
             names = sorted(new)
             self.compared = True
@@ -273,16 +319,19 @@ class Tester:
                 handle.write("\n".join(names) + "\n")
         return False, log
 
-    def run(self, levels, tag, env=None, reference=None):
+    def run(self, levels, tag, env=None, reference=None, recheck=None,
+            force=False):
         """Run levels and what they need; return (ok, failed level, log).
 
         `reference(level)` gives the failures of a comparing level on the
-        code before the import.  Without it such a level only has to run,
-        and what it reports is recorded.
+        code before the import, and `recheck(level)` measures them again.
+        Without a reference such a level only has to run, and what it
+        reports is recorded.  `force` runs levels already seen to pass.
         """
         tree = self.ws.tree()
         chain = self.conf.chain(levels)
-        todo = [n for n in chain if (tree, n) not in self.verified]
+        todo = [n for n in chain
+                if force or (tree, n) not in self.verified]
         if not todo:
             return True, None, None
         # references first: measuring one takes the workspace and the build
@@ -292,12 +341,12 @@ class Tester:
             for name in todo:
                 if self.conf.tests[name].compares:
                     refs[name] = reference(name)
-        if self.current != tree:
-            todo = chain          # the build directory holds another tree
-        self.current = tree
         self.compared, self.detail = False, ""
         for name in todo:
-            ok, log = self._level(name, tag, env, tree, refs.get(name))
+            ok, log = self._level(
+                name, tag, env, tree, refs.get(name),
+                recheck if name in refs else None,
+                lambda name=name: self._ready(chain, name, tag, env, tree))
             if not ok:
                 return False, name, log
             self.verified.add((tree, name))

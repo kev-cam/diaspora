@@ -714,14 +714,16 @@ class NoNewFailuresTests(World):
         self.assertEqual(ledger[self.p1]["tests"], ["compile", "suite"])
         self.assertEqual(ledger[self.pb]["verdict"], "failed")
         self.assertIn("1 new failure: src/e.c", ledger[self.pb]["note"])
-        self.assertEqual(out.count("measuring suite on"), 1)
         self.assertIn("1 failing, none new", out)
-        # the target before, the first import, the second import
-        self.assertEqual(self.runs(), 3)
+        # the target before; the first import; the second import, and for
+        # its new failure the code before it once more
+        self.assertEqual(out.count("measuring suite on"), 2)
+        self.assertIn("again: do they fail there too", out)
+        self.assertEqual(self.runs(), 4)
         # next run: what the last good import measured is the reference
         self.run_cli("import", "--yes", "--pick", self.p3, code=0)
         self.assertNotIn("measuring suite on", self.last_out)
-        self.assertEqual(self.runs(), 4)
+        self.assertEqual(self.runs(), 5)
 
     def test_diaspora_test_records_the_reference(self):
         out = self.run_cli("test", "suite", code=0)
@@ -739,7 +741,26 @@ class NoNewFailuresTests(World):
         out = self.run_cli("import", "--yes", "--pick", self.p1, code=0)
         self.assertIn("1 new failure) - retrying", out)
         self.assertEqual(self.ledger()[self.p1]["verdict"], "applied")
-        self.assertEqual(self.runs(), 3)
+        # reference, import, reference again (not there), import again
+        self.assertEqual(self.runs(), 4)
+
+    def test_a_lucky_reference_is_measured_again(self):
+        # a test that comes and goes passed in the one run that measured
+        # the reference and fails afterwards, import or no import
+        self.suite('{ [ "$(wc -l < %s)" != 1 ] && echo comes-and-goes; '
+                   'grep -l BROKEN src/*.c; } > "$DIASPORA_FAILURES"; true'
+                   % self.count)
+        out = self.run_cli("import", "--yes", "--pick", self.p1,
+                           "--pick", self.p3, code=0)
+        self.assertIn("1 failure not in the reference", out)
+        self.assertIn("1 also fails without the import", out)
+        ledger = self.ledger()
+        self.assertEqual(ledger[self.p1]["verdict"], "applied")
+        self.assertEqual(ledger[self.p3]["verdict"], "applied")
+        # reference, first import, reference again, second import: the
+        # first import's own measurement is the reference of the second
+        self.assertEqual(self.runs(), 4)
+        self.assertEqual(out.count("measuring suite on"), 2)
 
     def test_the_suite_must_report(self):
         self.suite("true")
