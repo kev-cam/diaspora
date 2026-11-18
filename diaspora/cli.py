@@ -19,7 +19,7 @@ from .workspace import Tester, Workspace
 
 COMMANDS = ("import", "list", "export", "status", "show", "continue", "skip",
             "abort", "promote", "reject", "defer", "reopen", "withhold",
-            "fetch", "log", "test", "init", "help")
+            "fetch", "log", "test", "init", "gui", "help")
 
 
 # -- shared helpers -------------------------------------------------------------
@@ -419,6 +419,12 @@ def cmd_log(repo, ui, args):
     return 0
 
 
+def cmd_gui(repo, ui, args):
+    from . import gui
+    Config.load(repo)                 # fail here, not in the page
+    return gui.serve(repo, args, ui)
+
+
 def cmd_test(repo, ui, args):
     conf = Config.load(repo)
     target = pick_target(repo, conf, args)
@@ -688,6 +694,20 @@ def build_parser():
     p.add_argument("--target", metavar="BRANCH")
     p.add_argument("-v", "--verbose", action="store_true")
     p.set_defaults(func=cmd_test)
+    p = sub.add_parser("gui", help="the pick list and the run in a browser "
+                       "page: accept, reject, defer, retry")
+    p.add_argument("peers", nargs="*")
+    p.add_argument("--port", type=int, default=0,
+                   help="port on 127.0.0.1 (default: any free one)")
+    p.add_argument("--no-browser", action="store_true",
+                   help="print the URL, do not open a browser")
+    p.add_argument("--no-fetch", action="store_true")
+    p.add_argument("--no-agent", action="store_true")
+    p.add_argument("--target", metavar="BRANCH")
+    p.add_argument("--here", action="store_true",
+                   help="import into the branch you are on")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.set_defaults(func=cmd_gui)
     p = sub.add_parser("init", help="write a starting diaspora.conf")
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_init)

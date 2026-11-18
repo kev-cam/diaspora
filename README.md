@@ -441,6 +441,7 @@ has been offered so it is not offered twice.
 | `diaspora promote` | copy a finished run to the target branch |
 | `diaspora reject` / `defer` / `reopen` / `withhold <commit...>` | record a verdict without importing |
 | `diaspora test [level...]` | run test levels on the target branch in the workspace |
+| `diaspora gui [peer...]` | the same in a browser page: accept, reject, defer, retry (below) |
 | `diaspora fetch`, `diaspora log`, `diaspora init` | |
 
 Useful options to `import`: `--yes` (take the suggested commits and promote
@@ -448,6 +449,35 @@ without asking), `--pick <commit>`, `--no-agent`, `--no-fetch`,
 `--strategy batch`, `--no-promote`, `--target <branch>`, `--here` (import
 into the branch you are on, whatever `target` says), `-v` (show test
 output as it runs).
+
+## In a browser: `diaspora gui`
+
+`diaspora gui` serves a page on 127.0.0.1 and opens it (`--no-browser`
+prints the address; `--port N`; over ssh, forward the port with
+`ssh -L`). It fetches and triages as `diaspora list` does and lists the
+candidates with their kind, size, the agent's opinion and, for a commit
+tried before, the last thing that went wrong (from `diaspora.log`). Each
+one can be marked:
+
+| mark | what Apply does |
+|---|---|
+| Accept | imports it, through the test gate |
+| Retry | the same, for a commit that failed before (`[!]`); the agent is told how |
+| Reject | records `rejected` (with the reason you give): never suggested again |
+| Defer | records `deferred`: hidden until "show ignored and deferred" |
+
+Apply records the rejections and deferrals and starts one import run with
+the accepted commits; its output scrolls under Output. The run is left on
+its branch, and the page shows what passed and what failed: **Accept:
+promote** copies it to the target, **Drop the run** throws it away
+(keeping what did not work in `diaspora.log` unless you untick that). A
+run that stopped for a conflict has Continue and Skip, as on the command
+line. The page and the command line share the run: either can finish
+what the other started.
+
+The address carries a random token, and requests must name this machine
+as their host, so neither other users of the machine nor other web pages
+can drive it.
 
 ## Running unattended
 
@@ -473,7 +503,8 @@ Version 0.1.
   agent porting and repair; stopping for a person and continuing, through
   a real terminal; batch testing; a broken baseline; suites with standing
   failures; a target branch that moves; both workspace kinds; verdicts;
-  diaspora.log, also after an abort; export.
+  diaspora.log, also after an abort; the browser page, over HTTP;
+  export.
 - Tried on a clone of kev-cam/nvc with nickg/nvc as the peer and Claude as
   the agent: the scan of 644 candidate commits takes about 3 seconds;
   agent triage of 40 commits took 34 seconds; two of Nick's fixes that

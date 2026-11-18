@@ -954,6 +954,146 @@ class TerminalTests(World):
         self.assertNotIn("return 2", self.read("src/a.c"))
 
 
+class GuiTests(World):
+    """The browser page's server, driven over HTTP as the page drives it."""
+
+    def setUp(self):
+        super().setUp()
+        import argparse
+        import http.server
+        import threading
+        from diaspora import gui
+        args = argparse.Namespace(peers=[], target=None, here=False,
+                                  no_agent=True, verbose=False, port=0)
+        self.app = gui.App(Repo(self.ours), args)
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0),
+                                                      gui.Handler)
+        port = self.server.server_address[1]
+        gui.Handler.app, gui.Handler.token = self.app, "secret"
+        gui.Handler.hosts = ("127.0.0.1:%d" % port,)
+        self.base = "http://127.0.0.1:%d" % port
+        threading.Thread(target=self.server.serve_forever,
+                         daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.post("/api/scan", {"fetch": True})
+
+    def call(self, path, body=None, token="secret"):
+        import urllib.error
+        import urllib.request
+        req = urllib.request.Request(self.base + path, headers={
+            "X-Diaspora-Token": token})
+        if body is not None:
+            req.data = json.dumps(body).encode()
+            req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = resp.read().decode()
+                code = resp.status
+        except urllib.error.HTTPError as exc:
+            data, code = exc.read().decode(), exc.code
+        try:
+            return code, json.loads(data)
+        except ValueError:
+            return code, data
+
+    def post(self, path, body):
+        code, out = self.call(path, body)
+        self.assertEqual(code, 200, out)
+        self.app.wait()
+        self.assertIsNone(self.app.job["error"], self.app.job)
+        return out
+
+    def state(self):
+        code, out = self.call("/api/state")
+        self.assertEqual(code, 200, out)
+        return out
+
+    def test_the_page_needs_the_token(self):
+        code, _ = self.call("/api/state", token="wrong")
+        self.assertEqual(code, 403)
+        code, page = self.call("/", token="secret")
+        self.assertEqual(code, 200)
+        self.assertIn('const TOKEN = "secret"', page)
+        code, _ = self.call("/api/mark", {"commits": [], "mark": "accept"},
+                            token="")
+        self.assertEqual(code, 403)
+
+    def test_accept_reject_defer_then_promote(self):
+        state = self.state()
+        shas = {c["commit"] for c in state["commits"]}
+        self.assertIn(self.p1, shas)
+        self.post("/api/mark", {"commits": [self.p1], "mark": "accept"})
+        self.post("/api/mark", {"commits": [self.p3], "mark": "reject",
+                                "why": "not ours"})
+        self.post("/api/mark", {"commits": [self.p2], "mark": "defer"})
+        marks = {c["commit"]: c["mark"] for c in self.state()["commits"]}
+        self.assertEqual(marks[self.p1], "accept")
+        self.post("/api/apply", {})
+        state = self.state()
+        self.assertEqual(state["run"]["stage"], "ready")
+        self.assertEqual([i["state"] for i in state["run"]["items"]],
+                         ["done"])
+        # nothing lands before the run is accepted
+        self.assertNotIn("return 2", self.read("src/a.c"))
+        self.post("/api/run", {"action": "promote"})
+        self.assertIsNone(self.state()["run"])
+        self.assertIn("return 2", self.read("src/a.c"))
+        ledger = self.ledger()
+        self.assertEqual(ledger[self.p1]["verdict"], "applied")
+        self.assertEqual(ledger[self.p3]["verdict"], "rejected")
+        self.assertEqual(ledger[self.p3]["note"], "not ours")
+        self.assertEqual(ledger[self.p2]["verdict"], "deferred")
+        self.assertEqual(self.app.marks, {})
+
+    def test_retry_after_a_failure(self):
+        self.post("/api/mark", {"commits": [self.p5], "mark": "accept"})
+        self.post("/api/apply", {})
+        run = self.state()["run"]
+        self.assertEqual(run["items"][0]["state"], "failed")
+        self.post("/api/run", {"action": "promote"})   # records the failure
+        c5 = {c["commit"]: c for c in self.state()["commits"]}[self.p5]
+        self.assertEqual(c5["status"], "failed")
+        self.assertIn("test regress failed", c5["tried"][0])
+        # an agent that can repair it this time; it hears of the failure
+        self.use_fake_agent()
+        self.app.args.no_agent = False
+        os.environ["FAKE_FIX"] = "sed -i s/BREAK/fine/ src/c.c"
+        os.environ["FAKE_PROMPT_LOG"] = os.path.join(self.tmp, "prompts")
+        self.post("/api/mark", {"commits": [self.p5], "mark": "retry"})
+        self.post("/api/apply", {})
+        self.assertEqual(self.state()["run"]["items"][0]["state"], "done")
+        self.post("/api/run", {"action": "promote"})
+        self.assertEqual(self.ledger()[self.p5]["verdict"], "adapted")
+        with open(os.environ["FAKE_PROMPT_LOG"]) as handle:
+            self.assertIn("tried before", handle.read())
+
+    def test_drop_the_run(self):
+        before = git(self.ours, "rev-parse", "main")
+        self.post("/api/mark", {"commits": [self.p1, self.p5],
+                                "mark": "accept"})
+        self.post("/api/apply", {})
+        code, out = self.call("/api/apply", {})        # a run is waiting
+        self.assertEqual(code, 400)
+        self.post("/api/run", {"action": "abort", "keep_log": False})
+        self.assertIsNone(self.state()["run"])
+        self.assertEqual(git(self.ours, "rev-parse", "main"), before)
+
+    def test_show_and_bad_requests(self):
+        code, out = self.call("/api/show?commit=" + self.p1)
+        self.assertEqual(code, 200)
+        self.assertIn("Fix crash in a", out["text"])
+        code, out = self.call("/api/show?commit=" + self.p1 + "&diff=1")
+        self.assertIn("return 2", out["text"])
+        code, out = self.call("/api/mark", {"commits": ["f" * 40],
+                                            "mark": "accept"})
+        self.assertEqual(code, 400)
+        code, out = self.call("/api/apply", {})
+        self.assertEqual(code, 200)
+        self.app.wait()
+        self.assertIn("nothing is marked", self.app.job["error"])
+
+
 class ExportTests(World):
     def test_export(self):
         self.run_cli("export", "up", "--yes", code=0)
