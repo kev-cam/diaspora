@@ -55,7 +55,6 @@ elif mode == "fix":
     command = os.environ.get("FAKE_FIX")
     if command:
         subprocess.run(command, shell=True, check=True)
-        git("add", "--update")
         print(json.dumps({"status": "fixed", "summary": "ran the fix"}))
     else:
         print(json.dumps({"status": "failed", "summary": "no idea"}))

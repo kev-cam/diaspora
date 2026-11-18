@@ -136,11 +136,14 @@ key adds to a list (`run` lines are joined with `&&`).
 	docs = none
 ```
 
-[`examples/`](examples) has the `diaspora.conf` of two real forks, nvc and
-Xyce. In both the full regression is the gate for every kind of change, and
-since their suites have failures of their own, it is a
-[no-new-failures](#a-suite-that-already-has-failures) gate fed by a
-regression harness.
+[`examples/`](examples) has the `diaspora.conf` of four real forks: nvc,
+Xyce, Icarus Verilog and VACASK. In all of them the full regression is the
+gate for every kind of change, and since their suites have failures of
+their own, it is a [no-new-failures](#a-suite-that-already-has-failures)
+gate, fed by a regression harness for the first three and by `ctest` for
+VACASK. Between them they show a separate build tree and an in-tree build,
+autotools and CMake, and a fork that shares no git history with its peer
+(`since`).
 
 ### `[diaspora]`
 
@@ -196,6 +199,9 @@ optional. Commands run in the import workspace with:
 A level tests whatever its command builds, so the build has to pick up
 everything an import can change: generated sources, a new file in the
 build system, a changed configure script. A stale build passes anything.
+A build that runs in the source tree may rewrite tracked files there (a
+regenerated `configure`); diaspora puts them back before the next import
+and keeps them out of what it commits.
 (nvc's `configure`, for one, turns maintainer mode off in a git worktree,
 after which make no longer regenerates its lexers;
 [`examples/nvc.diaspora.conf`](examples/nvc.diaspora.conf) shows the way
@@ -440,9 +446,9 @@ Version 0.1.
   agent triage of 40 commits took 34 seconds; two of Nick's fixes that
   conflicted with the fork were ported by the agent, passed a `compile`
   level and landed with their trailers and ledger entries.
-- kev-cam/nvc and kev-cam/xyce carry the `diaspora.conf` files in
-  [`examples/`](examples), with the full regression as the gate; what has
-  been run with them is in the commit messages there.
+- kev-cam/nvc, xyce, iverilog and VACASK carry the `diaspora.conf` files
+  in [`examples/`](examples), with the full regression as the gate; what
+  has been run with each is in its commit message there.
 
 Not there yet: several branches per peer, agent triage for exports (the
 export list is by message and by whether the peer has the files),

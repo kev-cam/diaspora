@@ -228,6 +228,8 @@ class Tester:
                     pass
                 proc.wait()
             reader.join(10)
+            if not reader.is_alive():
+                proc.stdout.close()
             out.write("### exit %d\n" % proc.returncode)
         if timed_out:
             return False, "timed out after %s" % fmt_secs(level.timeout)

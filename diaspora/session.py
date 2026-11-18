@@ -426,11 +426,11 @@ class Session:
             return
         self.ui.step("checking that %s passes without this import ..."
                      % level)
-        ws.git("checkout", "--quiet", "--detach", item["head0"])
+        ws.git("checkout", "--quiet", "--force", "--detach", item["head0"])
         try:
             ok, failed, log = self.tester.run([level], "baseline")
         finally:
-            ws.git("checkout", "--quiet", self.data["branch"])
+            ws.git("checkout", "--quiet", "--force", self.data["branch"])
         if not ok:
             # the import stays on the branch: `continue` tests it again
             raise Blocked(
@@ -445,11 +445,13 @@ class Session:
             return found
         self.ui.step("measuring %s on %s, before the import ..." % (
             level, sha[:10]))
-        self.ws.git("checkout", "--quiet", "--detach", sha)
+        # (--force: the build may have changed tracked files; they are build
+        # products here, the import itself is committed)
+        self.ws.git("checkout", "--quiet", "--force", "--detach", sha)
         try:
             ok, failed, log = self.tester.run([level], "reference")
         finally:
-            self.ws.git("checkout", "--quiet", self.data["branch"])
+            self.ws.git("checkout", "--quiet", "--force", self.data["branch"])
         if not ok:
             raise Blocked(
                 "test level %s does not run on the code before the import "
@@ -495,6 +497,9 @@ class Session:
                    "%s (full list: %s).  Tests that failed before are not "
                    "your concern.\n" % (detail, log[:-4] + ".new-failures")
             if detail else "")
+        # tracked files the build itself changed (a regenerated configure,
+        # say) are not part of the repair
+        built = set(self.ws.git("diff", "--name-only").splitlines())
         self.ui.step("agent: looking at the %s failure ..." % level)
         answer = self.agent.ask("fix", prompt, FIX_SCHEMA, cwd=self.ws.path)
         if not answer:
@@ -505,7 +510,10 @@ class Session:
         if answer.get("status") != "fixed":
             return False
         ws = self.ws
-        ws.git("add", "--update")
+        edited = [path for path in ws.git("diff", "--name-only").splitlines()
+                  if path not in built]
+        if edited:
+            ws.git("add", "--", *edited)
         if ws.ok("diff", "--cached", "--quiet"):
             return False
         message = ws.git("show", "-s", "--format=%B", "HEAD")
@@ -725,7 +733,7 @@ class Session:
                     % data["target"])
             data["restore"] = self.repo.current_branch() or ws.head()
             self.save()
-        ws.git("checkout", "--quiet", data["branch"])
+        ws.git("checkout", "--quiet", "--force", data["branch"])
         if data["ledger_commit"]:
             ws.git("reset", "--quiet", "--hard", "HEAD~1")
         proc = ws.proc("rebase", "--quiet", data["target"], check=False)
@@ -781,6 +789,7 @@ class Session:
             return
         kept = [i for i in data["items"] if i["state"] in ("picked", "done")]
         old = ws.head()
+        ws.git("reset", "--quiet", "--hard")      # drop what a build changed
         proc = ws.proc("rebase", "--quiet", tip, check=False)
         new = [] if proc.returncode else ws.git(
             "rev-list", "--reverse", "%s..HEAD" % tip).split()

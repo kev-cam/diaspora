@@ -438,6 +438,21 @@ class ImportTests(World):
         self.assertIn("also changed: src/d.c", out)
         self.assertIn("also changed: src/d.c", self.ledger()[self.p5]["note"])
 
+    def test_what_the_build_changes_is_not_part_of_a_repair(self):
+        # an in-tree build that rewrites a tracked file (a regenerated
+        # configure, say) must not leak into the import
+        self.use_fake_agent('[test "compile"]\n'
+                            '\trun = echo built >> src/d.c\n')
+        os.environ["FAKE_FIX"] = "sed -i s/BREAK/fine/ src/c.c"
+        out = self.run_cli("import", "--pick", self.p5, "--pick", self.p3,
+                           "--yes", code=0)
+        self.assertEqual(self.read("src/c.c"), "fine")
+        self.assertNotIn("built", self.read("src/d.c"))
+        self.assertNotIn("also changed", out)
+        self.assertEqual(self.ledger()[self.p3]["verdict"], "applied")
+        self.assertEqual(git(self.ours, "status", "--porcelain",
+                             "--untracked-files=no"), "")
+
     def test_agent_says_superseded(self):
         self.use_fake_agent()
         os.environ["FAKE_PORT"] = "superseded"
