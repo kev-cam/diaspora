@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(HERE))
 
 from diaspora import cli, scan, triage                      # noqa: E402
 from diaspora import ledger as L                            # noqa: E402
+from diaspora import tried as T                             # noqa: E402
 from diaspora.agent import Agent, _json_object              # noqa: E402
 from diaspora.config import Config, parse_duration          # noqa: E402
 from diaspora.gitutil import DiasporaError, PathSet, Repo   # noqa: E402
@@ -72,7 +73,8 @@ class World(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, env)
         patcher.start()
         self.addCleanup(patcher.stop)
-        for name in ("FAKE_TRIAGE", "FAKE_PORT", "FAKE_FIX", "NO_COLOR"):
+        for name in ("FAKE_TRIAGE", "FAKE_PORT", "FAKE_FIX", "NO_COLOR",
+                     "FAKE_PROMPT_LOG"):
             os.environ.pop(name, None)
 
         self.peer = os.path.join(self.tmp, "peer")
@@ -152,6 +154,14 @@ class World(unittest.TestCase):
         repo = Repo(self.ours)
         return {e["commit"]: e for e in L.Ledger.at(
             repo, "main", "diaspora.ledger").latest(direction).values()}
+
+    def tried(self, ref="main"):
+        """{commit: [diaspora.log blocks]} on `ref`."""
+        out = {}
+        for sha, text in T.Log.at(Repo(self.ours), ref,
+                                  "diaspora.log").blocks:
+            out.setdefault(sha, []).append(text)
+        return out
 
     def subjects(self, rng="main"):
         return git(self.ours, "log", "--format=%s", rng).splitlines()
@@ -386,6 +396,17 @@ class ImportTests(World):
         self.assertEqual(ledger[self.p5]["verdict"], "failed")
         self.assertIn("test regress failed", ledger[self.p5]["note"])
         self.assertIn("1 imported, 2 failed", out)
+        # how they failed is told in diaspora.log, in the same commit
+        tried = self.tried()
+        self.assertEqual(set(tried), {self.p4, self.p5})
+        self.assertIn("conflicts in src/b.c", tried[self.p4][0])
+        self.assertIn("test regress failed", tried[self.p5][0])
+        self.assertTrue(tried[self.p5][0].rstrip().endswith("=> failed"))
+        self.assertNotIn("(log:", tried[self.p5][0])   # a local path
+        self.assertTrue(self.read("diaspora.log").startswith(
+            "# diaspora.log - "))
+        self.assertIn("diaspora.log", git(self.ours, "show", "--stat",
+                                          "--format=", "main"))
         self.assertEqual(git(self.ours, "branch", "--list", "diaspora/*"),
                          "")
         self.assertEqual(git(self.ours, "status", "--porcelain",
@@ -400,6 +421,9 @@ class ImportTests(World):
         self.assertIn("[!]", out)
         self.assertEqual(self.subjects(before + "..main")[0],
                          "diaspora: 1 applied, 2 failed")
+        out = self.run_cli("show", self.p5, code=0)
+        self.assertIn("tried before (diaspora.log)", out)
+        self.assertIn("test regress failed", out)
 
     def test_agent_ports_and_fixes(self):
         self.use_fake_agent()
@@ -421,6 +445,13 @@ class ImportTests(World):
         self.assertIn("agent: ported - took the peer's side", out)
         self.assertIn("repaired after regress failed",
                       ledger[self.p5]["note"])
+        # p4 was ported and passed: nothing went wrong; p5 needed a repair
+        tried = self.tried()
+        self.assertEqual(set(tried), {self.p5})
+        self.assertIn("test regress failed", tried[self.p5][0])
+        self.assertIn("agent repair: fixed - ran the fix", tried[self.p5][0])
+        self.assertIn("=> passed after the repair (adapted)",
+                      tried[self.p5][0])
         self.assertNotIn("also changed", out)
         with open(os.environ["FAKE_AGENT_LOG"]) as handle:
             self.assertEqual(handle.read().split(),
@@ -547,6 +578,55 @@ class ImportTests(World):
         ledger = self.ledger()
         self.assertEqual(ledger[self.p4]["verdict"], "failed")
         self.assertEqual(ledger[self.p1]["verdict"], "applied")
+
+    def test_abort_keeps_what_did_not_work(self):
+        found, _ = self.candidates()
+        before = git(self.ours, "rev-parse", "main")
+        session = self.session(interactive=True)
+        self.assertEqual(session.start("import", "main",
+                                       [found[self.p5], found[self.p4]]),
+                         "paused")
+        self.run_cli("abort", code=0)
+        self.assertIn("ledger is unchanged", self.last_out)
+        self.assertEqual(self.subjects(before + "..main"),
+                         ["diaspora: 1 attempt that did not work"])
+        self.assertEqual(self.ledger(), {})
+        self.assertEqual(set(self.tried()), {self.p5})
+        self.assertEqual(git(self.ours, "branch", "--list", "diaspora/*"),
+                         "")
+
+    def test_abort_without_the_log(self):
+        found, _ = self.candidates()
+        before = git(self.ours, "rev-parse", "main")
+        session = self.session(interactive=True)
+        session.start("import", "main", [found[self.p5], found[self.p4]])
+        self.run_cli("abort", "--no-log", code=0)
+        self.assertIn("nothing was recorded", self.last_out)
+        self.assertEqual(git(self.ours, "rev-parse", "main"), before)
+
+    def test_the_agent_hears_of_earlier_attempts(self):
+        self.run_cli("import", "--yes", "--pick", self.p5, code=4)
+        self.run_cli("reopen", self.p5, code=0)
+        self.use_fake_agent()
+        os.environ["FAKE_FIX"] = "sed -i s/BREAK/fine/ src/c.c"
+        os.environ["FAKE_PROMPT_LOG"] = os.path.join(self.tmp, "prompts")
+        self.run_cli("import", "--yes", "--pick", self.p5, code=0)
+        with open(os.environ["FAKE_PROMPT_LOG"]) as handle:
+            prompts = handle.read()
+        self.assertIn("This commit was tried before and did not work",
+                      prompts)
+        self.assertIn("up@%s" % self.p5, prompts)
+        self.assertEqual(len(self.tried()[self.p5]), 2)
+        self.assertIn("\n\n", self.read("diaspora.log"))   # blocks apart
+
+    def test_a_compile_failure_is_told_by_its_error(self):
+        self.local_conf('[test "compile"]\n\trun = ! grep -q BREAK src/*.c '
+                        '|| { echo "$DIASPORA_SRC/src/c.c:1: error: BREAK"; '
+                        'false; }\n')
+        self.run_cli("import", "--yes", "--pick", self.p5, code=4)
+        block = self.tried()[self.p5][0]
+        self.assertIn("test compile failed: src/c.c:1: error: BREAK", block)
+        self.assertNotIn(self.tmp, block)
 
     def test_batch_falls_back_to_each(self):
         out = self.run_cli("import", "--yes", "--strategy", "batch",
@@ -714,6 +794,8 @@ class NoNewFailuresTests(World):
         self.assertEqual(ledger[self.p1]["tests"], ["compile", "suite"])
         self.assertEqual(ledger[self.pb]["verdict"], "failed")
         self.assertIn("1 new failure: src/e.c", ledger[self.pb]["note"])
+        self.assertIn("test suite failed: 1 new failure: src/e.c",
+                      self.tried()[self.pb][0])
         self.assertIn("1 failing, none new", out)
         # the target before; the first import; the second import, and for
         # its new failure the code before it once more

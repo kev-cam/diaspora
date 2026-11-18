@@ -4,9 +4,11 @@
 Imports are applied one commit at a time on a branch of their own
 (`diaspora/import/<id>`) in the workspace.  Each one must pass the test
 levels diaspora.conf requires for it; what passes is fast-forwarded onto
-the target branch together with the ledger entries.  The state of a run
-lives in .git/diaspora/session.json, so a run that stops for a conflict
-can be picked up again with `diaspora continue`.
+the target branch together with the ledger entries, and with an account
+in diaspora.log of every attempt that did not work (that much is kept even
+when the run is aborted).  The state of a run lives in
+.git/diaspora/session.json, so a run that stops for a conflict can be
+picked up again with `diaspora continue`.
 """
 
 import json
@@ -16,6 +18,7 @@ import time
 
 from . import ledger as L
 from . import scan
+from . import tried as T
 from .gitutil import DiasporaError, GitError, run
 from .workspace import Tester, Workspace, tail
 
@@ -49,7 +52,7 @@ Commit {sha}:
 See it with `git show {sha}`.
 
 State of the working tree: {state}
-{divergence}
+{divergence}{history}
 Do this:
  1. Resolve every conflict and check that the applied hunks make sense
     against the code here.  Where the code here has diverged, re-implement
@@ -77,7 +80,7 @@ required test level "{level}" failed.  The same level passes without the
 import.
 
 Test command: {command}
-{detail}End of the log ({log}):
+{detail}{history}End of the log ({log}):
 ---
 {tail}
 ---
@@ -125,6 +128,7 @@ class Session:
         self.data = None
         self.tester = None
         self._remeasured = set()     # (commit, level) references run again
+        self._before = None          # diaspora.log on the target
 
     # -- persistence ----------------------------------------------------------
     def exists(self):
@@ -266,9 +270,45 @@ class Session:
                 if os.path.isfile(full):
                     os.remove(full)
 
-    def _fail(self, item, note):
+    def _fail(self, item, note, tried=True):
         self._reset(item["head0"])
         item["state"], item["note"] = "failed", note
+        if tried:
+            self._tried(item, note)
+
+    # -- what did not work (diaspora.log) ------------------------------------------
+    def _tried(self, item, line):
+        item.setdefault("tried", []).append(line)
+
+    def _history(self, item):
+        """What diaspora.log says about earlier attempts at this commit."""
+        if self._before is None:
+            self._before = T.Log.at(self.repo, self.data["target"],
+                                    self.conf.log)
+        blocks = self._before.about(item["sha"])[-3:]
+        if not blocks:
+            return ""
+        return ("\nThis commit was tried before and did not work (from "
+                "%s); do not repeat what failed:\n%s\n" % (
+                    self.conf.log, "\n".join(blocks)))
+
+    def _log_text(self, items=None):
+        """diaspora.log blocks for the attempts of this run that failed, or
+        that passed only after a repair."""
+        out = []
+        date = time.strftime("%Y-%m-%d")
+        for item in self.data["items"] if items is None else items:
+            if item["state"] == "failed":
+                outcome = "failed"
+            elif item["state"] == "done" and item.get("setback"):
+                outcome = "passed after the repair (%s)" % item.get(
+                    "mode", L.ADAPTED)
+            else:
+                continue
+            out.append(T.block(date, self.data["id"], self.data["dir"],
+                               item["peer"], item["sha"], item["subject"],
+                               item.get("tried") or [item["note"]], outcome))
+        return "\n".join(out)
 
     def _pick(self, item):
         peer = self.conf.peer(item["peer"])
@@ -296,13 +336,17 @@ class Session:
                     else "applies, but touches code rewritten here"))
                 if self.agent.port_enabled:
                     status, summary = self._port(item, commit, unmerged)
+                    self._tried(item, "%s; agent: %s - %s" % (
+                        "cherry-pick: conflicts in " + ", ".join(unmerged)
+                        if unmerged else "cherry-pick applies, but touches "
+                        "code rewritten here", status, summary))
                     if status in (L.SUPERSEDED, L.NOT_APPLICABLE):
                         self._reset(item["head0"])
                         item["state"], item["note"] = status, summary
                         return None
                     if status != "ported":
                         return self._fail(item, "agent could not port it: "
-                                          + summary)
+                                          + summary, tried=False)
                     adapted, item["note"] = True, summary
                 elif unmerged and self.interactive:
                     item["state"], item["note"] = "paused", "conflict"
@@ -400,8 +444,8 @@ class Session:
         prompt = PORT_PROMPT.format(
             source=source, dest=dest, ws=self.ws.path, sha=item["sha"],
             message=(commit.subject + "\n\n" + commit.body).strip(),
-            state=state, divergence=divergence,
-            meta="diaspora.conf, %s" % self.conf.ledger)
+            state=state, divergence=divergence, history=self._history(item),
+            meta="diaspora.conf, %s, %s" % (self.conf.ledger, self.conf.log))
         self.ui.step("agent: porting ...")
         answer = self.agent.ask("port", prompt, PORT_SCHEMA, cwd=self.ws.path)
         if not answer:
@@ -494,12 +538,17 @@ class Session:
             detail = self.tester.detail
             if not self.tester.compared:
                 self._baseline(item, level)
+            item["setback"] = True
+            self._tried(item, T.tests_line(
+                level, self.tester.new_failures,
+                "" if self.tester.compared else T.first_error(
+                    log, (self.ws.path, self.ws.build))))
             if attempts > 0:
                 attempts -= 1
                 if self._fix(item, level, log, detail):
                     continue
             self._fail(item, "test %s failed%s (log: %s)" % (
-                level, ", " + detail if detail else "", log))
+                level, ", " + detail if detail else "", log), tried=False)
             return
 
     def _fix(self, item, level, log, detail=""):
@@ -510,17 +559,21 @@ class Session:
             detail="Tests that pass without the import and fail with it: "
                    "%s (full list: %s).  Tests that failed before are not "
                    "your concern.\n" % (detail, log[:-4] + ".new-failures")
-            if detail else "")
+            if detail else "", history=self._history(item))
         # tracked files the build itself changed (a regenerated configure,
         # say) are not part of the repair
         built = set(self.ws.git("diff", "--name-only").splitlines())
         self.ui.step("agent: looking at the %s failure ..." % level)
         answer = self.agent.ask("fix", prompt, FIX_SCHEMA, cwd=self.ws.path)
         if not answer:
-            self.ui.step("agent: %s" % (self.agent.last_error or "no answer"))
+            why = self.agent.last_error or "no answer"
+            self.ui.step("agent: %s" % why)
+            self._tried(item, "agent repair: " + why)
             return False
         summary = _brief(answer.get("summary"))
         self.ui.step("agent: %s - %s" % (answer.get("status"), summary))
+        self._tried(item, "agent repair: %s - %s" % (answer.get("status"),
+                                                     summary))
         if answer.get("status") != "fixed":
             return False
         ws = self.ws
@@ -529,6 +582,7 @@ class Session:
         if edited:
             ws.git("add", "--", *edited)
         if ws.ok("diff", "--cached", "--quiet"):
+            self._tried(item, "agent repair: changed nothing in the import")
             return False
         message = ws.git("show", "-s", "--format=%B", "HEAD")
         message = re.sub(r"^(Diaspora-Origin: .*)\(applied\)\s*$",
@@ -609,20 +663,30 @@ class Session:
                                    note=item["note"] or None))
         return out
 
-    def _commit_ledger(self, entries):
-        if not entries:
+    def _commit_ledger(self, entries, log=""):
+        """One commit with the ledger entries and the diaspora.log blocks."""
+        if not entries and not log:
             return False
-        path = os.path.join(self.ws.path, self.conf.ledger)
-        L.append(path, entries)
-        self.ws.git("add", "--", self.conf.ledger)
+        if entries:
+            L.append(os.path.join(self.ws.path, self.conf.ledger), entries)
+            self.ws.git("add", "--", self.conf.ledger)
+        if log:
+            T.append(os.path.join(self.ws.path, self.conf.log), log)
+            self.ws.git("add", "--", self.conf.log)
         counts = {}
         for item in entries:
             counts[item["verdict"]] = counts.get(item["verdict"], 0) + 1
-        subject = "diaspora: " + ", ".join(
-            "%d %s" % (n, v) for v, n in sorted(counts.items()))
+        tries = len(T.Log(log).blocks)
+        subject = "diaspora: " + (", ".join(
+            "%d %s" % (n, v) for v, n in sorted(counts.items())) or
+            "%d attempt%s that did not work" % (tries,
+                                                "" if tries == 1 else "s"))
         body = "\n".join("%-14s %s@%s %s" % (
             e["verdict"], e["peer"], e["commit"][:10], e.get("subject", ""))
             for e in entries)
+        if log:
+            body += ("\n\n" if body else "") + \
+                "What did not work is told in %s." % self.conf.log
         self.ws.git("commit", "--quiet", "-F", "-",
                     input=subject + "\n\n" + body + "\n")
         return True
@@ -630,10 +694,12 @@ class Session:
     def _finalize(self):
         entries = self._entries()
         self.data["entries"] = entries
+        self.data["log"] = self._log_text()
         if self.export:
             self.data["stage"] = "exported"
         else:
-            self.data["ledger_commit"] = self._commit_ledger(entries)
+            self.data["ledger_commit"] = self._commit_ledger(
+                entries, self.data["log"])
             self.data["stage"] = "ready"
         self.save()
 
@@ -657,6 +723,8 @@ class Session:
         for item in failed:
             self.ui.say("  failed  %s %s  %s" % (
                 item["sha"][:10], item["subject"][:50], item["note"]))
+        if data.get("log"):
+            self.ui.say("What did not work goes into %s." % self.conf.log)
         tip = self.repo.rev(data["branch"])
         if tip == data["base"]:
             self._cleanup()
@@ -686,12 +754,15 @@ class Session:
         for item in failed:
             self.ui.say("  failed  %s %s  %s" % (
                 item["sha"][:10], item["subject"][:50], item["note"]))
-        entries = data["entries"]
+        entries, log = data["entries"], data.get("log", "")
         branch = data["branch"]
         self._archive()
         if not done:
             self.repo.proc("branch", "-D", branch, check=False)
             self.ui.say("Nothing to export.")
+            if log:
+                record(self.repo, self.conf, self.ui, self.agent,
+                       data["target"], [], log)
             return "nothing"
         self.ui.say("%d commit%s for %s on branch %s (based on %s %s)." % (
             len(done), "" if len(done) == 1 else "s", peer.name, branch,
@@ -700,9 +771,9 @@ class Session:
                     "your fork and open a pull request,")
         self.ui.say("or mail it: git format-patch %s..%s" % (peer.ref,
                                                               branch))
-        if entries:
+        if entries or log:
             record(self.repo, self.conf, self.ui, self.agent, data["target"],
-                   entries)
+                   entries, log)
         return "exported"
 
     def promote(self):
@@ -755,7 +826,7 @@ class Session:
         if proc.returncode:
             ws.proc("rebase", "--abort", check=False)
             if data["ledger_commit"]:
-                self._commit_ledger(data["entries"])
+                self._commit_ledger(data["entries"], data.get("log", ""))
             raise DiasporaError(
                 "the imports do not replay cleanly on the new %s; they are "
                 "kept on branch %s" % (data["target"], data["branch"]))
@@ -771,7 +842,7 @@ class Session:
             lambda name: self._reference(tip, name, True)) if levels \
             else (True, None, None)
         if data["ledger_commit"]:
-            self._commit_ledger(data["entries"])
+            self._commit_ledger(data["entries"], data.get("log", ""))
         self.save()
         if not ok:
             raise DiasporaError(
@@ -841,6 +912,9 @@ class Session:
                     "continue`" % (paused["note"], self.ws.path))
             if paused["state"] == "picked":
                 paused["note"] = "conflicts resolved by hand"
+                self._tried(paused, "cherry-pick: conflicts in %s; resolved "
+                            "by hand" % ", ".join(paused.get("conflicts")
+                                                  or ["?"]))
             self.save()
         return self.run()
 
@@ -854,8 +928,11 @@ class Session:
         self.save()
         return self.run()
 
-    def abort(self):
+    def abort(self, keep_log=True):
+        """Drop the run.  The ledger is not touched, but what was tried and
+        did not work still goes into diaspora.log on the target."""
         data = self.data
+        log = self._log_text() if keep_log and not self.export else ""
         if os.path.isdir(self.ws.path) and self.repo.current_branch(
                 cwd=self.ws.path) == data["branch"]:
             self.ws.proc("cherry-pick", "--quit", check=False)
@@ -863,11 +940,20 @@ class Session:
             self.ws.end(data.get("restore"))
         self.repo.proc("branch", "-D", data["branch"], check=False)
         self._archive()
-        self.ui.say("Run %s dropped; nothing was recorded." % data["id"])
+        if not log:
+            self.ui.say("Run %s dropped; nothing was recorded." % data["id"])
+            return
+        self.ui.say("Run %s dropped; the ledger is unchanged." % data["id"])
+        try:
+            record(self.repo, self.conf, self.ui, self.agent, data["target"],
+                   [], log)
+        except DiasporaError as exc:
+            self.ui.warn("what did not work was not recorded: %s" % exc)
 
 
-def record(repo, conf, ui, agent, target, entries):
-    """Commit ledger entries on `target` without importing anything."""
+def record(repo, conf, ui, agent, target, entries, log=""):
+    """Commit ledger entries (and diaspora.log blocks) on `target` without
+    importing anything."""
     session = Session(repo, conf, ui, agent, interactive=False,
                       assume_yes=True)
     if session.exists():
@@ -887,7 +973,7 @@ def record(repo, conf, ui, agent, target, entries):
     session.data["restore"] = session.ws.begin(session.data["branch"],
                                                session.data["base"])
     session.save()
-    session._commit_ledger(entries)
+    session._commit_ledger(entries, log)
     session.ws.end(session.data["restore"])
     session.data["restore"] = None
     where = repo.worktrees().get(target)
@@ -904,5 +990,11 @@ def record(repo, conf, ui, agent, target, entries):
                 target, proc.stderr.strip(), session.data["branch"]))
     repo.proc("branch", "-D", session.data["branch"], check=False)
     session._archive()
-    ui.say("Recorded %d verdict%s in %s on %s." % (
-        len(entries), "" if len(entries) == 1 else "s", conf.ledger, target))
+    if entries:
+        ui.say("Recorded %d verdict%s in %s on %s." % (
+            len(entries), "" if len(entries) == 1 else "s", conf.ledger,
+            target))
+    if log:
+        tries = len(T.Log(log).blocks)
+        ui.say("Recorded %d attempt%s that did not work in %s on %s." % (
+            tries, "" if tries == 1 else "s", conf.log, target))

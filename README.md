@@ -159,6 +159,7 @@ autotools and CMake, and a fork that shares no git history with its peer
 | `workspace` | `worktree` (separate, kept between runs) or `inplace` (your checkout, which must be clean) | `worktree` |
 | `worktree`, `build` | where the worktree and its build directory live | `~/.cache/diaspora/<repo>/` |
 | `ledger` | the ledger file | `diaspora.ledger` |
+| `log` | the account of what was tried and did not work | `diaspora.log` |
 
 Kinds: `bugfix security perf feature test refactor docs build ci style
 other`; `all` and `none` also work. Kinds in neither `import` nor `ignore`
@@ -377,6 +378,31 @@ lines, `diaspora.ledger merge=union` in `.gitattributes` merges them.
 
 To set a whole stretch of a peer's history aside, give the peer a `since`.
 
+### What did not work: `diaspora.log`
+
+The ledger says what became of a commit; `diaspora.log`, committed next to
+it, says how an attempt went wrong. It is plain text, appended to and
+never rewritten: one block for each import that failed, or that passed
+only after the agent repaired it, with the conflicts and what the agent
+made of them, each test level that failed with its new failures by name,
+and each repair the agent tried (a made-up example, the commit shortened):
+
+```
+2026-11-17 run 20261117-210412 import nickg@df04425a0c... Handle empty named port connections
+  cherry-pick: conflicts in src/elab.c; agent: ported - re-did the check in our elab_ports()
+  test full-regression failed: 2 new failures: nvc/regr:issue812, nvc/regr:ports7
+  agent repair: fixed - an empty connection is open, not missing
+  => passed after the repair (adapted)
+```
+
+It goes into the same commit as the ledger entries, and it is kept even
+when a run is aborted (`diaspora abort --no-log` drops it too): the
+attempt still happened. When a commit is tried again, `diaspora show`
+prints what went wrong before, and the agent porting or repairing it is
+told, so it need not repeat it. Imports that pass at the first try, and
+commits the agent finds superseded or not applicable, leave no block; the
+ledger has those.
+
 ## Trust
 
 Importing a commit means running a peer's code in your tests, and letting
@@ -410,8 +436,8 @@ has been offered so it is not offered twice.
 | `diaspora list [peer...]` | list only; `--json`, `--all`, `--max N` |
 | `diaspora export <peer>` | prepare a branch of our commits for a peer |
 | `diaspora status` | peers, ledger counts, the run in progress |
-| `diaspora show <commit>` | a candidate, with its triage |
-| `diaspora continue` / `skip` / `abort` | after a conflict: go on, leave the commit out, drop the run |
+| `diaspora show <commit>` | a candidate, with its triage, verdict and earlier attempts |
+| `diaspora continue` / `skip` / `abort` | after a conflict: go on, leave the commit out, drop the run (what did not work is still recorded) |
 | `diaspora promote` | copy a finished run to the target branch |
 | `diaspora reject` / `defer` / `reopen` / `withhold <commit...>` | record a verdict without importing |
 | `diaspora test [level...]` | run test levels on the target branch in the workspace |
@@ -430,8 +456,8 @@ the tested result on its `diaspora/import/*` branch for a person to look
 at; `--yes` alone also promotes. Things to know for scheduled or cloud
 runs:
 
-- A fresh clone sees only what is committed: `diaspora.conf` and the
-  ledger are there, `diaspora.local.conf` and the triage cache are not.
+- A fresh clone sees only what is committed: `diaspora.conf`, the
+  ledger and `diaspora.log` are there, `diaspora.local.conf` and the triage cache are not.
 - diaspora never pushes. If the job pushes, push `diaspora/*` branches,
   not the default branch, and protect the default branch as a backstop.
 - The first build in a new workspace is a full build. Choose the required
@@ -447,7 +473,7 @@ Version 0.1.
   agent porting and repair; stopping for a person and continuing, through
   a real terminal; batch testing; a broken baseline; suites with standing
   failures; a target branch that moves; both workspace kinds; verdicts;
-  export.
+  diaspora.log, also after an abort; export.
 - Tried on a clone of kev-cam/nvc with nickg/nvc as the peer and Claude as
   the agent: the scan of 644 candidate commits takes about 3 seconds;
   agent triage of 40 commits took 34 seconds; two of Nick's fixes that

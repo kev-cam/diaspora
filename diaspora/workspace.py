@@ -127,7 +127,8 @@ class Tester:
         self.current = None       # the tree the build directory holds
         self.compared = False     # the last failure was new failing tests
         self.detail = ""          # ... and which
-        self.meta = {CONF_NAME, LOCAL_NAME, conf.ledger}
+        self.new_failures = []    # ... all of them
+        self.meta = {CONF_NAME, LOCAL_NAME, conf.ledger, conf.log}
 
     # -- measured failures ----------------------------------------------------
     def key(self, rev="HEAD"):
@@ -311,6 +312,7 @@ class Tester:
         if new:
             names = sorted(new)
             self.compared = True
+            self.new_failures = names
             self.detail = "%d new failure%s: %s%s" % (
                 len(names), "" if len(names) == 1 else "s",
                 ", ".join(names[:8]), " ..." if len(names) > 8 else "")
@@ -341,7 +343,7 @@ class Tester:
             for name in todo:
                 if self.conf.tests[name].compares:
                     refs[name] = reference(name)
-        self.compared, self.detail = False, ""
+        self.compared, self.detail, self.new_failures = False, "", []
         for name in todo:
             ok, log = self._level(
                 name, tag, env, tree, refs.get(name),

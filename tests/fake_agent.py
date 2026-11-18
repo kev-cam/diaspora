@@ -7,6 +7,8 @@
   port    takes the incoming side of every conflict, or does what
           $FAKE_PORT says: "superseded", "not-applicable", "failed"
   fix     runs the shell command in $FAKE_FIX and reports "fixed"
+
+The mode goes to $FAKE_AGENT_LOG and the prompt to $FAKE_PROMPT_LOG.
 """
 import json
 import os
@@ -18,6 +20,8 @@ mode = sys.argv[1]
 prompt = sys.stdin.read()
 with open(os.environ.get("FAKE_AGENT_LOG", os.devnull), "a") as log:
     log.write(mode + "\n")
+with open(os.environ.get("FAKE_PROMPT_LOG", os.devnull), "a") as log:
+    log.write(prompt + "\n")
 
 
 def git(*args):

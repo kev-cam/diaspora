@@ -183,7 +183,7 @@ def import_candidates(repo, conf, peer, target, ledger):
     taken = origins(repo, target, "^" + peer.ref)
     verdicts = ledger.latest("import", peer.name)
     peer_paths, peer_exclude = Config.peer_export_rules(repo, peer.ref)
-    meta = {CONF_NAME, LOCAL_NAME, conf.ledger}
+    meta = {CONF_NAME, LOCAL_NAME, conf.ledger, conf.log}
     keep = []
     for commit in commits:
         commit.peer = peer.name
@@ -224,7 +224,7 @@ def export_candidates(repo, conf, peer, target, ledger):
         return [], dropped
     same = equivalents(repo, peer.ref, target)
     verdicts = ledger.latest("export", peer.name)
-    meta = {CONF_NAME, LOCAL_NAME, conf.ledger}
+    meta = {CONF_NAME, LOCAL_NAME, conf.ledger, conf.log}
     keep = []
     for commit in commits:
         commit.peer = peer.name
@@ -250,7 +250,7 @@ def export_candidates(repo, conf, peer, target, ledger):
 
 def dropped_paths(conf, peer, commit, direction="import"):
     """Files of a commit that must not travel with it."""
-    meta = {CONF_NAME, LOCAL_NAME, conf.ledger}
+    meta = {CONF_NAME, LOCAL_NAME, conf.ledger, conf.log}
     out = []
     for path in commit.paths:
         if path in meta:

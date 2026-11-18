@@ -9,6 +9,7 @@ import time
 
 from . import __version__, scan, triage
 from . import ledger as L
+from . import tried as T
 from .agent import Agent
 from .config import CONF_NAME, KINDS, LOCAL_NAME, Config
 from .gitutil import DiasporaError, Repo
@@ -323,6 +324,8 @@ def cmd_show(repo, ui, args):
             ui.say("\nledger (%s): %s %s%s" % (
                 direction, item["verdict"], item["date"],
                 " - " + item["note"] if item.get("note") else ""))
+    for text in T.Log.at(repo, target, conf.log).about(commit.sha):
+        ui.say("\ntried before (%s):\n%s" % (conf.log, text.rstrip()))
     if not cached:
         ui.say("\nkind (from the message): %s" % commit.kind)
     return 0
@@ -349,7 +352,7 @@ def cmd_skip(repo, ui, args):
 
 
 def cmd_abort(repo, ui, args):
-    _session(repo, ui, args).abort()
+    _session(repo, ui, args).abort(keep_log=not args.no_log)
     return 0
 
 
@@ -651,6 +654,10 @@ def build_parser():
                        help="do not ask before promoting")
         p.add_argument("--no-agent", action="store_true")
         p.add_argument("-v", "--verbose", action="store_true")
+        if name == "abort":
+            p.add_argument("--no-log", action="store_true",
+                           help="do not record in diaspora.log what was "
+                           "tried and did not work")
         p.set_defaults(func=func)
 
     for name, text in (

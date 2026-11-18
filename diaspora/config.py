@@ -19,6 +19,7 @@ from .gitutil import DiasporaError, PathSet
 CONF_NAME = "diaspora.conf"
 LOCAL_NAME = "diaspora.local.conf"
 LEDGER_NAME = "diaspora.ledger"
+LOG_NAME = "diaspora.log"
 
 KINDS = ("bugfix", "security", "perf", "feature", "test", "refactor",
          "docs", "build", "ci", "style", "other")
@@ -242,6 +243,7 @@ class Config:
         if self.promote not in ("ask", "yes", "no"):
             self._err("diaspora.promote must be ask, yes or no")
         self.ledger = one(d, "", "ledger", LEDGER_NAME)
+        self.log = one(d, "", "log", LOG_NAME)
 
         def_import = self._kinds(d, "", "import", DEFAULT_IMPORT)
         def_ignore = self._kinds(d, "", "ignore", DEFAULT_IGNORE)
