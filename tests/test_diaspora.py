@@ -68,6 +68,9 @@ class World(unittest.TestCase):
             "GIT_COMMITTER_EMAIL": "t@example.org",
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
             "XDG_CACHE_HOME": os.path.join(self.tmp, "cache"),
+            # never the real ~/.config/diaspora
+            "DIASPORA_CONFIG": os.path.join(self.tmp, "config",
+                                            "diaspora"),
             "FAKE_AGENT_LOG": os.path.join(self.tmp, "agent.log"),
         }
         patcher = mock.patch.dict(os.environ, env)
@@ -1105,7 +1108,6 @@ class UserConfTests(World):
                          '[repo "gone"]\n\tpath = %s/nowhere\n'
                          % (self.ours, self.tmp))
         os.environ["DIASPORA_CONFIG"] = self.conf_file
-        self.addCleanup(os.environ.pop, "DIASPORA_CONFIG", None)
         self.away = os.path.join(self.tmp, "away")
         os.mkdir(self.away)
         old = os.getcwd()
@@ -1176,6 +1178,41 @@ class UserConfTests(World):
         shutil.copy(self.conf_file, os.path.join(base, "diaspora", "config"))
         with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": base}):
             self.run_raw("-C", "mine", "status", code=0)
+
+    def test_a_repository_used_is_added(self):
+        os.environ["DIASPORA_CONFIG"] = path = os.path.join(self.tmp, "new")
+        out = self.run_raw("status", cwd=self.ours, code=0)
+        self.assertIn('(added %s to %s as "ours")' % (self.ours, path),
+                      self.last_err)
+        with open(path) as handle:
+            text = handle.read()
+        self.assertTrue(text.startswith("# ~/.config/diaspora"))
+        self.assertIn('[repo "ours"]\n\tpath = %s\n' % self.ours, text)
+        self.run_raw("status", cwd=os.path.join(self.ours, "src"), code=0)
+        self.assertNotIn("added", self.last_err)
+        # from anywhere now, by name
+        self.run_raw("-C", "ours", "status", code=0)
+        # a worktree counts as its main checkout; a checkout without
+        # diaspora.conf is not added
+        wt = os.path.join(self.tmp, "wt")
+        git(self.ours, "worktree", "add", "-q", wt)
+        self.run_raw("status", cwd=wt, code=0)
+        self.assertNotIn("added", self.last_err)
+        other = os.path.join(self.tmp, "other")
+        git(self.tmp, "init", "-q", other)
+        self.run_raw("-C", other, "repos", code=0)
+        with open(path) as handle:
+            self.assertEqual(handle.read(), text)
+
+    def test_the_same_name_twice(self):
+        os.environ["DIASPORA_CONFIG"] = path = os.path.join(self.tmp, "two")
+        with open(path, "w") as handle:
+            handle.write('[repo "ours"]\n\tpath = /elsewhere/ours')  # no \n
+        self.run_raw("status", cwd=self.ours, code=0)
+        name = "%s-ours" % os.path.basename(self.tmp)
+        self.assertIn('as "%s"' % name, self.last_err)
+        with open(path) as handle:
+            self.assertIn('ours\n[repo "%s"]' % name, handle.read())
 
     def test_the_page_starts_without_a_repository(self):
         import argparse

@@ -468,6 +468,10 @@ them (with any run in progress), and diaspora started outside a repository,
 or in one without a `diaspora.conf`, asks which of them to work on (on a
 terminal; otherwise it says to use `-C`). `diaspora gui` started that way
 offers the list on the page, and its header switches between them.
+You need not write it: the first time diaspora is used in a repository
+that has a `diaspora.conf` (from inside it, or a worktree of it, or with
+`-C <path>`), it adds the repository under its directory name, making the
+file if there is none, and says so on stderr.
 `~/.config/diaspora` may also be a directory with a file `config` in it;
 `$XDG_CONFIG_HOME` and `$DIASPORA_CONFIG` are honoured.
 

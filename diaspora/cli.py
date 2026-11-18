@@ -494,6 +494,11 @@ def open_repo(args, ui):
         repo = None
     if repo is not None and (named or args.cmd == "init" or os.path.isfile(
             os.path.join(repo.top, CONF_NAME)) or not user.repos):
+        added = user.remember(repo)
+        if added:                     # (not on stdout: --json)
+            print('(added %s to %s as "%s")' % (user.repos[added],
+                                                user.source, added),
+                  file=sys.stderr)
         return repo
     # not in a repository diaspora looks after: choose one
     if args.cmd in NO_REPO:
