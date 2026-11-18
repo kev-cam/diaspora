@@ -442,6 +442,7 @@ has been offered so it is not offered twice.
 | `diaspora reject` / `defer` / `reopen` / `withhold <commit...>` | record a verdict without importing |
 | `diaspora test [level...]` | run test levels on the target branch in the workspace |
 | `diaspora gui [peer...]` | the same in a browser page: accept, reject, defer, retry (below) |
+| `diaspora repos` | the repositories in `~/.config/diaspora` |
 | `diaspora fetch`, `diaspora log`, `diaspora init` | |
 
 Useful options to `import`: `--yes` (take the suggested commits and promote
@@ -449,6 +450,26 @@ without asking), `--pick <commit>`, `--no-agent`, `--no-fetch`,
 `--strategy batch`, `--no-promote`, `--target <branch>`, `--here` (import
 into the branch you are on, whatever `target` says), `-v` (show test
 output as it runs).
+
+## Your repositories: `~/.config/diaspora`
+
+List the repositories diaspora looks after in `~/.config/diaspora` (same
+syntax as `diaspora.conf`):
+
+```
+[repo "nvc"]
+	path = /usr/local/src/nvc
+[repo "xyce"]
+	path = /usr/local/src/xyce
+```
+
+Then `diaspora -C xyce status` works from anywhere, `diaspora repos` lists
+them (with any run in progress), and diaspora started outside a repository,
+or in one without a `diaspora.conf`, asks which of them to work on (on a
+terminal; otherwise it says to use `-C`). `diaspora gui` started that way
+offers the list on the page, and its header switches between them.
+`~/.config/diaspora` may also be a directory with a file `config` in it;
+`$XDG_CONFIG_HOME` and `$DIASPORA_CONFIG` are honoured.
 
 ## In a browser: `diaspora gui`
 
@@ -504,6 +525,7 @@ Version 0.1.
   a real terminal; batch testing; a broken baseline; suites with standing
   failures; a target branch that moves; both workspace kinds; verdicts;
   diaspora.log, also after an abort; the browser page, over HTTP;
+  `~/.config/diaspora` and choosing a repository;
   export.
 - Tried on a clone of kev-cam/nvc with nickg/nvc as the peer and Claude as
   the agent: the scan of 644 candidate commits takes about 3 seconds;

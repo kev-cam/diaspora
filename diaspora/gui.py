@@ -29,9 +29,10 @@ import webbrowser
 from . import ledger as L
 from . import tried as T
 from .config import Config
-from .gitutil import DiasporaError
+from .gitutil import DiasporaError, Repo
 from .session import Session, record
 from .ui import UI
+from .userconf import UserConf
 
 MARKS = ("accept", "reject", "defer", "retry")
 
@@ -88,6 +89,43 @@ class App:
         self.marks = {}             # sha -> mark
         self.notes = {}             # sha -> why (for reject and defer)
         self.agent_cost = 0.0
+        self.fetch = not getattr(args, "no_fetch", False)
+
+    # -- which repository ----------------------------------------------------------
+    def repos(self):
+        """The repositories of ~/.config/diaspora (and the one open now)."""
+        user = UserConf.load()
+        here = self.repo.top if self.repo is not None else None
+        out = [{"name": name, "path": where, "note": note,
+                "run": "" if note == "missing" else self.cli.run_state(where),
+                "current": where == here}
+               for name, where, note in user.listing()]
+        if here and not any(r["current"] for r in out):
+            out.insert(0, {"name": os.path.basename(here), "path": here,
+                           "note": "", "run": "", "current": True})
+        return out
+
+    def switch(self, name):
+        """Work on another repository (one of repos())."""
+        if self.busy():
+            raise DiasporaError("busy: %s is still running" % self.job["name"])
+        hit = [r for r in self.repos() if r["name"] == name]
+        if not hit:
+            raise DiasporaError("no repository called %r" % name)
+        if hit[0]["note"]:
+            raise DiasporaError("%s: %s" % (name, hit[0]["note"]))
+        repo = Repo(hit[0]["path"])
+        Config.load(repo)                   # it must have a diaspora.conf
+        self.repo = repo
+        self.args.target = None             # (named for the first one only)
+        self.args.here = False
+        self.commits, self.scanned = [], None
+        self.marks.clear()
+        self.notes.clear()
+        self.ui.say("")
+        self.ui.say("== now working on %s" % repo.top)
+        self.start("fetch and scan" if self.fetch else "scan", self.do_scan,
+                   self.fetch)
 
     # -- helpers ----------------------------------------------------------------
     def conf(self):
@@ -108,7 +146,9 @@ class App:
                        interactive=False, assume_yes=False)
 
     def session_file(self):
-        return os.path.join(self.repo.state_dir(), "session.json")
+        if self.repo is None:
+            raise DiasporaError("pick a repository first")
+        return os.path.join(self.repo.state, "session.json")
 
     # -- jobs (one at a time, in a thread) --------------------------------------
     def busy(self):
@@ -213,6 +253,13 @@ class App:
 
     # -- what the page sees ------------------------------------------------------
     def state(self, since=0):
+        if self.repo is None:
+            count, lines = self.ui.since(since)
+            return {"repo": None, "repos": self.repos(), "commits": [],
+                    "run": None, "busy": self.busy(), "log": lines,
+                    "log_count": count, "scanned": None,
+                    "job": dict(self.job) if self.job else None,
+                    "peers": [], "tests": [], "agent_cost": 0}
         conf = self.conf()
         target = self.target(conf)
         log = T.Log.at(self.repo, target, conf.log)
@@ -250,6 +297,7 @@ class App:
             "job": dict(self.job) if self.job else None,
             "busy": self.busy(), "log": lines, "log_count": count,
             "agent_cost": round(self.agent_cost, 2),
+            "repos": self.repos(),
         }
 
     def show(self, sha, diff=False):
@@ -323,6 +371,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if url.path == "/":
                 return self._send(200, PAGE.replace("@TOKEN@", self.token),
                                   "text/html")
+            if url.path != "/api/state" and self.app.repo is None:
+                raise DiasporaError("pick a repository first")
             if url.path == "/api/state":
                 since = int((query.get("since") or ["0"])[0])
                 return self._json(200, self.app.state(since))
@@ -348,7 +398,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._json(400, {"error": "bad JSON"})
         app = self.app
         try:
-            if url.path == "/api/mark":
+            if url.path == "/api/repo":
+                app.switch(body.get("name", ""))
+            elif self.app.repo is None:
+                raise DiasporaError("pick a repository first")
+            elif url.path == "/api/mark":
                 app.mark(body.get("commits") or [], body.get("mark"),
                          body.get("why", ""))
             elif url.path == "/api/scan":
@@ -379,9 +433,12 @@ def serve(repo, args, ui):
     Handler.app, Handler.token = app, token
     Handler.hosts = ("127.0.0.1:%d" % port, "localhost:%d" % port)
     url = "http://127.0.0.1:%d/?token=%s" % (port, token)
-    app.start("fetch and scan" if not args.no_fetch else "scan",
-              app.do_scan, not args.no_fetch)
-    ui.say("diaspora gui for %s at" % repo.top)
+    if repo is not None:
+        app.start("fetch and scan" if app.fetch else "scan", app.do_scan,
+                  app.fetch)
+        ui.say("diaspora gui for %s at" % repo.top)
+    else:
+        ui.say("diaspora gui (pick the repository on the page) at")
     ui.say("  " + url)
     ui.say("(only this machine can reach it; over ssh: ssh -L %d:127.0.0.1:"
            "%d ...).  Ctrl-C stops it." % (port, port))
@@ -430,6 +487,13 @@ header { padding: 14px 20px; border-bottom: 1px solid var(--line);
 header h1 { font-size: 17px; margin: 0; }
 header .meta { color: var(--dim); font-size: 13px; }
 header .meta code { font-family: var(--mono); color: var(--ink); }
+header select { font: inherit; font-weight: 600; background: var(--panel);
+  color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px; }
+#pick .repo { display: flex; gap: 12px; align-items: baseline; padding: 6px 0;
+  border-bottom: 1px solid var(--line); }
+#pick .repo:last-child { border-bottom: 0; }
+#pick .repo button { min-width: 110px; text-align: left; }
+#pick .repo code { font-family: var(--mono); font-size: 12.5px; color: var(--dim); flex: 1; }
 main { padding: 16px 20px 120px; max-width: 1400px; }
 button { font: inherit; border: 1px solid var(--line); background: var(--panel);
   color: var(--ink); border-radius: 6px; padding: 3px 10px; cursor: pointer; }
@@ -497,9 +561,12 @@ dialog pre { margin: 0; padding: 12px 14px; font-family: var(--mono); font-size:
 <body>
 <header>
   <h1>diaspora</h1>
+  <select id="repo" title="repository" hidden></select>
   <span class="meta" id="where"></span>
 </header>
 <main>
+  <section class="run" id="pick" hidden></section>
+  <div id="work">
   <section class="run" id="run" hidden></section>
   <div class="toolbar">
     <button id="fetch">Fetch and rescan</button>
@@ -515,6 +582,7 @@ dialog pre { margin: 0; padding: 12px 14px; font-family: var(--mono); font-size:
     </tr></thead>
     <tbody id="rows"><tr><td colspan="6" class="dim">scanning ...</td></tr></tbody>
   </table>
+  </div>
 </main>
 <footer>
   <div class="bar">
@@ -642,7 +710,38 @@ function renderRun() {
     <div class="actions">${acts}</div>`;
 }
 
+function renderRepos() {
+  const sel = $("repo"), repos = S.repos || [];
+  const key = repos.map(r => r.name + (r.current ? "*" : "")).join(",");
+  if (sel.dataset.key !== key) {
+    sel.dataset.key = key;
+    sel.innerHTML = (S.repo ? "" : '<option value="">choose …</option>') +
+      repos.map(r => `<option value="${esc(r.name)}" ${r.current ? "selected" : ""} ${
+        r.note ? "disabled" : ""}>${esc(r.name)}${r.note ? " (" + esc(r.note) + ")" : ""}</option>`).join("");
+  }
+  sel.hidden = repos.length < 2 && !!S.repo;
+  sel.disabled = S.busy;
+  const pick = $("pick");
+  pick.hidden = !!S.repo;
+  $("work").hidden = !S.repo;
+  if (!S.repo) {
+    pick.innerHTML = `<h2>Which repository?</h2>` + (repos.length ? repos.map(r =>
+      `<div class="repo"><button data-repo="${esc(r.name)}" ${r.note || S.busy ? "disabled" : ""}>${
+        esc(r.name)}</button><code>${esc(r.path)}</code><span class="dim">${
+        esc([r.note, r.run].filter(Boolean).join(", "))}</span></div>`).join("") :
+      `<p class="dim">No repositories listed in ~/.config/diaspora. Add some:</p>
+       <pre>[repo "name"]\n    path = /path/to/checkout</pre>`);
+  }
+}
+
 function render() {
+  renderRepos();
+  if (!S.repo) {
+    $("where").textContent = "";
+    $("status").textContent = S.job && S.job.error ? S.job.error : "";
+    $("apply").disabled = $("clear").disabled = true;
+    return;
+  }
   $("where").innerHTML = `<code>${esc(S.repo)}</code> → <code>${esc(S.target)}</code> at ${
     esc(S.head)} · peers ${S.peers.map(p => esc(p.name)).join(", ")} · gate: ${
     esc(S.tests.join(" → ") || "none")}${S.strategy === "batch" ? " (batch)" : ""}`;
@@ -706,6 +805,7 @@ document.addEventListener("click", ev => {
   const b = ev.target.closest("button, a");
   if (!b) return;
   if (b.dataset.show) return showCommit(b.dataset.show, false);
+  if (b.dataset.repo) return act("/api/repo", {name: b.dataset.repo});
   if (b.dataset.mark) {
     const c = S.commits.find(x => x.commit === b.dataset.sha);
     let mark = b.dataset.mark, why = "";
@@ -730,6 +830,7 @@ $("apply").onclick = () => act("/api/apply", {});
 $("clear").onclick = () => act("/api/mark", {
   commits: S.commits.filter(c => c.mark).map(c => c.commit), mark: "clear"});
 $("logbtn").onclick = () => toggleLog();
+$("repo").onchange = () => { if ($("repo").value) act("/api/repo", {name: $("repo").value}); };
 $("showall").onchange = $("peer").onchange = () => renderRows();
 $("dlgclose").onclick = () => $("dlg").close();
 $("dlgdiff").onclick = () => showCommit(shown, $("dlgdiff").dataset.diff === "1");

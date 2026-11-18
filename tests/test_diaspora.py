@@ -1094,6 +1094,110 @@ class GuiTests(World):
         self.assertIn("nothing is marked", self.app.job["error"])
 
 
+class UserConfTests(World):
+    """~/.config/diaspora: the repositories, chosen by name or from a list."""
+
+    def setUp(self):
+        super().setUp()
+        self.conf_file = os.path.join(self.tmp, "userconf")
+        with open(self.conf_file, "w") as handle:
+            handle.write('[repo "mine"]\n\tpath = %s\n'
+                         '[repo "gone"]\n\tpath = %s/nowhere\n'
+                         % (self.ours, self.tmp))
+        os.environ["DIASPORA_CONFIG"] = self.conf_file
+        self.addCleanup(os.environ.pop, "DIASPORA_CONFIG", None)
+        self.away = os.path.join(self.tmp, "away")
+        os.mkdir(self.away)
+        old = os.getcwd()
+        self.addCleanup(os.chdir, old)
+
+    def run_raw(self, *args, cwd=None, code=None, answers=None):
+        """`answers`: a terminal, and what is typed at it."""
+        os.chdir(cwd or self.away)
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(contextlib.redirect_stdout(out))
+            stack.enter_context(contextlib.redirect_stderr(err))
+            if answers is not None:
+                for stream in (sys.stdin, out):
+                    stack.enter_context(mock.patch.object(
+                        stream, "isatty", return_value=True))
+                stack.enter_context(mock.patch("builtins.input",
+                                               side_effect=answers))
+            got = cli.main(list(args))
+        self.last_out, self.last_err = out.getvalue(), err.getvalue()
+        if code is not None:
+            self.assertEqual(got, code, self.last_out + self.last_err)
+        return self.last_out
+
+    def test_by_name(self):
+        out = self.run_raw("-C", "mine", "status", code=0)
+        self.assertIn("Peer up:", out)
+        self.run_raw("-C", "MINE", "status", code=0)      # any case
+        self.run_raw("-C", "nosuch", "status", code=1)
+        self.assertIn("nor a repository of that name", self.last_err)
+        self.assertIn("mine, gone", self.last_err)
+
+    def test_not_in_a_repository_and_no_terminal(self):
+        self.run_raw("status", code=1)
+        self.assertIn("say which repository with -C NAME: mine, gone",
+                      self.last_err)
+        # in a checkout without diaspora.conf, the same
+        other = os.path.join(self.tmp, "other")
+        git(self.tmp, "init", "-q", other)
+        self.run_raw("status", cwd=other, code=1)
+        self.assertIn("no diaspora.conf here", self.last_err)
+        # in one of them, no question
+        self.run_raw("status", cwd=os.path.join(self.ours, "src"), code=0)
+
+    def test_pick_from_a_list(self):
+        out = self.run_raw("status", code=0, answers=["9", "mine"])
+        self.assertIn("Which one?", out)
+        self.assertNotIn("gone", out.split("Which one?")[1].split(
+            "Number")[0])                                  # missing: not offered
+        self.assertIn("not one of them: '9'", out)
+        self.assertIn("Peer up:", out)
+        self.run_raw("status", code=1, answers=[""])
+        self.assertIn("no repository chosen", self.last_err)
+
+    def test_repos(self):
+        out = self.run_raw("repos", code=0)
+        self.assertIn("mine", out)
+        self.assertIn("(missing)", out)
+        out = self.run_raw("repos", "--json", cwd=self.ours, code=0)
+        rows = {r["name"]: r for r in json.loads(out)["repos"]}
+        self.assertTrue(rows["mine"]["current"])
+        self.assertEqual(rows["gone"]["note"], "missing")
+
+    def test_a_config_directory(self):
+        del os.environ["DIASPORA_CONFIG"]
+        base = os.path.join(self.tmp, "xdg")
+        os.makedirs(os.path.join(base, "diaspora"))
+        shutil.copy(self.conf_file, os.path.join(base, "diaspora", "config"))
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": base}):
+            self.run_raw("-C", "mine", "status", code=0)
+
+    def test_the_page_starts_without_a_repository(self):
+        import argparse
+        from diaspora import gui
+        args = argparse.Namespace(peers=[], target=None, here=False,
+                                  no_agent=True, verbose=False, port=0,
+                                  no_fetch=False)
+        app = gui.App(None, args)
+        state = app.state()
+        self.assertIsNone(state["repo"])
+        self.assertEqual([r["name"] for r in state["repos"]],
+                         ["mine", "gone"])
+        with self.assertRaises(DiasporaError):
+            app.switch("gone")
+        app.switch("mine")
+        app.wait()
+        self.assertIsNone(app.job["error"], app.job)
+        state = app.state()
+        self.assertEqual(state["repo"], self.ours)
+        self.assertIn(self.p1, {c["commit"] for c in state["commits"]})
+
+
 class ExportTests(World):
     def test_export(self):
         self.run_cli("export", "up", "--yes", code=0)

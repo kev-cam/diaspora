@@ -58,6 +58,34 @@ class UI:
         answer = answer.strip().lower()
         return default if not answer else answer in ("y", "yes")
 
+    def pick_repo(self, repos, run_state=None):
+        """Ask which of [(name, path, note)] to work on; its name, or None."""
+        usable = [r for r in repos if r[2] != "missing"]
+        print("Not in a repository diaspora looks after.  Which one?")
+        width = max(len(r[0]) for r in repos) if repos else 0
+        for num, (name, where, note) in enumerate(usable, 1):
+            extra = [note] if note else []
+            state = run_state(where) if run_state else ""
+            if state:
+                extra.append(state)
+            print("%3d  %-*s  %s%s" % (num, width, name, where,
+                                       "  (%s)" % ", ".join(extra)
+                                       if extra else ""))
+        while True:
+            try:
+                line = input("Number or name (empty to stop): ").strip()
+            except EOFError:
+                print()
+                return None
+            if not line:
+                return None
+            if line.isdigit() and 1 <= int(line) <= len(usable):
+                return usable[int(line) - 1][0]
+            hits = [r[0] for r in usable if r[0].lower() == line.lower()]
+            if hits:
+                return hits[0]
+            print("not one of them: %r" % line)
+
     # -- the list -----------------------------------------------------------------
     def table(self, commits, marked):
         if not commits:

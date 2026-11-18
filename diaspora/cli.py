@@ -15,11 +15,12 @@ from .config import CONF_NAME, KINDS, LOCAL_NAME, Config
 from .gitutil import DiasporaError, Repo
 from .session import Session, record
 from .ui import UI
+from .userconf import UserConf
 from .workspace import Tester, Workspace
 
 COMMANDS = ("import", "list", "export", "status", "show", "continue", "skip",
             "abort", "promote", "reject", "defer", "reopen", "withhold",
-            "fetch", "log", "test", "init", "gui", "help")
+            "fetch", "log", "test", "init", "gui", "repos", "help")
 
 
 # -- shared helpers -------------------------------------------------------------
@@ -421,8 +422,91 @@ def cmd_log(repo, ui, args):
 
 def cmd_gui(repo, ui, args):
     from . import gui
-    Config.load(repo)                 # fail here, not in the page
+    if repo is not None:
+        Config.load(repo)             # fail here, not in the page
     return gui.serve(repo, args, ui)
+
+
+def run_state(where):
+    """'' or what the diaspora run in progress in a checkout is doing."""
+    try:
+        repo = Repo(where)
+        with open(os.path.join(repo.state, "session.json"),
+                  encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (DiasporaError, OSError, ValueError):
+        return ""
+    return "run %s %s" % (data.get("id", "?"), data.get("stage", "?"))
+
+
+def cmd_repos(repo, ui, args):
+    user = UserConf.load()
+    here = repo.top if repo is not None else None
+    rows = []
+    for name, where, note in user.listing():
+        rows.append({"name": name, "path": where, "note": note,
+                     "run": "" if note == "missing" else run_state(where),
+                     "current": where == here})
+    if args.json:
+        print(json.dumps({"config": user.source, "repos": rows}, indent=1))
+        return 0
+    if not rows:
+        ui.say("No repositories in %s.  Add them like this:\n\n"
+               "[repo \"name\"]\n\tpath = /path/to/checkout" % user.source)
+        return 0
+    width = max(len(r["name"]) for r in rows)
+    for row in rows:
+        extra = ", ".join(x for x in (row["note"], row["run"]) if x)
+        ui.say("%s %-*s  %s%s" % ("*" if row["current"] else " ", width,
+                                  row["name"], row["path"],
+                                  "  (%s)" % extra if extra else ""))
+    return 0
+
+
+# commands that need no repository, or that offer a choice of their own
+NO_REPO = ("repos", "gui")
+
+
+def open_repo(args, ui):
+    """The repository to work on: -C (a directory, or a name from
+    ~/.config/diaspora), else the one we are in, else the user's choice."""
+    user = UserConf.load()
+    where, named = args.dir, args.dir != "."
+    if named and not os.path.isdir(where):
+        found = user.find(where)
+        if not found:
+            raise DiasporaError(
+                "-C %s: no such directory, nor a repository of that name in "
+                "%s%s" % (where, user.source, " (%s)" % ", ".join(user.repos)
+                          if user.repos else ""))
+        where = found
+    try:
+        repo = Repo(where)
+    except DiasporaError:
+        if named or not user.repos:
+            if args.cmd in NO_REPO:
+                return None
+            raise DiasporaError(
+                "not inside a git repository: %s%s" % (
+                    os.path.abspath(where), "" if named else
+                    " (list the repositories diaspora looks after in %s to "
+                    "choose one from anywhere)" % user.source))
+        repo = None
+    if repo is not None and (named or args.cmd == "init" or os.path.isfile(
+            os.path.join(repo.top, CONF_NAME)) or not user.repos):
+        return repo
+    # not in a repository diaspora looks after: choose one
+    if args.cmd in NO_REPO:
+        return None
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        name = ui.pick_repo(user.listing(), run_state)
+        if name is None:
+            raise DiasporaError("no repository chosen")
+        return Repo(user.repos[name])
+    raise DiasporaError(
+        "%s; say which repository with -C NAME: %s" % (
+            "no %s here" % CONF_NAME if repo is not None
+            else "not inside a git repository", ", ".join(user.repos)))
 
 
 def cmd_test(repo, ui, args):
@@ -588,7 +672,8 @@ def build_parser():
         epilog="With no command, `import` is run: it lists what the peers "
                "have for us and asks what to take.")
     parser.add_argument("-C", dest="dir", default=".", metavar="DIR",
-                        help="run as if started in DIR")
+                        help="run as if started in DIR, or in the repository "
+                        "of that name in ~/.config/diaspora")
     parser.add_argument("--version", action="version",
                         version="diaspora " + __version__)
     sub = parser.add_subparsers(dest="cmd", metavar="command")
@@ -708,6 +793,10 @@ def build_parser():
                    help="import into the branch you are on")
     p.add_argument("-v", "--verbose", action="store_true")
     p.set_defaults(func=cmd_gui)
+    p = sub.add_parser("repos", help="the repositories in "
+                       "~/.config/diaspora")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_repos)
     p = sub.add_parser("init", help="write a starting diaspora.conf")
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_init)
@@ -730,7 +819,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     ui = UI()
     try:
-        repo = Repo(args.dir)
+        repo = open_repo(args, ui)
         return args.func(repo, ui, args) or 0
     except DiasporaError as exc:
         ui.warn(str(exc))
