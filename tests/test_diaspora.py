@@ -4,6 +4,7 @@
 Run with `make check` or `python3 -m unittest discover -s tests`.
 """
 
+import argparse
 import contextlib
 import io
 import json
@@ -1257,6 +1258,51 @@ class UserConfTests(World):
         self.assertIn("you cannot write to %s" % objects, self.last_err)
         self.run_raw("-C", "mine", "gui", "--no-browser", code=1)
         self.assertIn("you cannot write", self.last_err)
+
+    def test_finding_claude(self):
+        """`claude` not on PATH: found where its installer puts it; or
+        named in ~/.config/diaspora; else a warning that says what to do."""
+        from diaspora.config import AgentConf
+        home = os.path.join(self.tmp, "home")
+        local = os.path.join(home, ".local", "bin")
+        os.makedirs(local)
+        with mock.patch.dict(os.environ, {"HOME": home, "PATH": "/usr/bin:/bin"}):
+            self.assertFalse(AgentConf().found)
+            exe = os.path.join(local, "claude")
+            with open(exe, "w") as handle:
+                handle.write("#!/bin/sh\n")
+            os.chmod(exe, 0o755)
+            agent = AgentConf()
+            self.assertEqual(agent.path, exe)
+            self.assertEqual(AgentConf(command=["claude", "-x"]).argv,
+                             [exe, "-x"])
+            os.remove(exe)
+            # the warning (diaspora.conf names no agent here)
+            conf = os.path.join(self.ours, "diaspora.conf")
+            with open(conf) as handle:
+                text = handle.read()
+            with open(conf, "w") as handle:
+                handle.write(text.replace("\tcommand = none\n", ""))
+            ui = mock.Mock()
+            args = argparse.Namespace(no_agent=False, verbose=False)
+            cli.make_agent(Repo(self.ours), Config.load(Repo(self.ours)),
+                           ui, args)
+            said = ui.warn.call_args[0][0]
+            self.assertIn("Claude Code (`claude`), is not installed", said)
+            self.assertIn("install.sh", said)
+            self.assertIn("[agent] command", said)
+            # named in the user's file
+            with open(self.conf_file, "a") as handle:
+                handle.write("[agent]\n\tcommand = %s %s\n"
+                             % (sys.executable, FAKE))
+            got = Config.load(Repo(self.ours)).agent
+            self.assertTrue(got.found)
+            self.assertEqual(got.protocol, "plain")
+            self.assertEqual(got.argv, [sys.executable, FAKE])
+            # but diaspora.conf, when it names one, wins
+            with open(conf, "w") as handle:
+                handle.write(text)
+            self.assertFalse(Config.load(Repo(self.ours)).agent.enabled)
 
     def test_the_same_name_twice(self):
         os.environ["DIASPORA_CONFIG"] = path = os.path.join(self.tmp, "two")

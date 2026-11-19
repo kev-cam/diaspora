@@ -119,8 +119,36 @@ class AgentConf:
         return bool(self.command) and self.command[0] != "none"
 
     @property
+    def path(self):
+        """Where the command is: on PATH, or for a bare `claude`, where
+        Claude Code's installers put it (often not on PATH); None if
+        nowhere."""
+        if not self.enabled:
+            return None
+        name = self.command[0]
+        hit = shutil.which(os.path.expanduser(name))
+        if hit or os.sep in name:
+            return hit
+        home = os.path.expanduser("~")
+        for where in AGENT_PLACES.get(name, ()):
+            where = os.path.join(home, where)
+            if os.path.isfile(where) and os.access(where, os.X_OK):
+                return where
+        return None
+
+    @property
     def found(self):
-        return self.enabled and shutil.which(self.command[0]) is not None
+        return self.path is not None
+
+    @property
+    def argv(self):
+        """The command to run, found."""
+        return [self.path or self.command[0]] + self.command[1:]
+
+
+# where Claude Code's installers put `claude`, under the user's home
+AGENT_PLACES = {"claude": (".local/bin/claude", ".claude/local/claude",
+                           ".npm-global/bin/claude", "bin/claude")}
 
 
 class Config:
@@ -329,7 +357,16 @@ class Config:
         self.export_paths = PathSet(words("export", "", "paths"))
 
         a = "agent"
-        command = split_words(self._values(a, "", "command")) or ["claude"]
+        command = split_words(self._values(a, "", "command"))
+        if not command:
+            # not named here: the user's own choice (~/.config/diaspora;
+            # it differs from one user to the next), else Claude Code
+            from .userconf import UserConf
+            try:
+                command = split_words(UserConf.load().agent_command)
+            except DiasporaError:
+                command = []
+        command = command or ["claude"]
         protocol = one(a, "", "protocol") or (
             "claude" if os.path.basename(command[0]) == "claude" else "plain")
         if protocol not in ("claude", "plain"):

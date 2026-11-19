@@ -10,6 +10,12 @@ none).  Same syntax as diaspora.conf:
     [repo "xyce"]
         path = /usr/local/src/xyce
 
+It may also name the agent command, which differs from user to user (a
+diaspora.conf that names one wins):
+
+    [agent]
+        command = /opt/claude/bin/claude
+
 ~/.config/diaspora may also be a directory holding a file `config`;
 $XDG_CONFIG_HOME replaces ~/.config, and $DIASPORA_CONFIG names the file
 outright.
@@ -45,7 +51,11 @@ class UserConf:
     def __init__(self, entries=(), source=None):
         self.source = source
         self.repos = {}             # name -> path, in the file's order
+        self.agent_command = []     # [agent] command = ..., if given
         for section, sub, key, value in entries:
+            if section == "agent" and not sub and key == "command":
+                self.agent_command.append(value)
+                continue
             if section != "repo":
                 continue
             if not sub:

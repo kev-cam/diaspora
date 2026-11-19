@@ -298,7 +298,7 @@ directory, job counts, which agent.
 
 | key | meaning | default |
 |-----|---------|---------|
-| `command` | the agent; `none` for no agent | `claude` |
+| `command` | the agent; `none` for no agent | `[agent] command` in `~/.config/diaspora`, else `claude` (on `PATH`, or in `~/.local/bin`) |
 | `triage` | `auto`: ask about commits the message pass is unsure of; `all`; `off` | `auto` |
 | `triage-batch`, `triage-max`, `triage-jobs` | commits per question, commits per run, questions asked at once | 20, 100, 4 |
 | `port` | let the agent port conflicts and repair test failures | `true` |
@@ -485,6 +485,17 @@ and what it starts; your git config is not changed: for git by hand, add
 it with `git config --global --add safe.directory DIR`). Otherwise
 diaspora says what is missing (including "you joined the group after
 logging in") and stops, still listing the repository.
+The agent runs as whoever runs diaspora, so each user needs Claude Code
+installed and logged in (`curl -fsSL https://claude.ai/install.sh | bash`,
+then `claude` once). diaspora finds it on `PATH` or in `~/.local/bin`; if
+it is elsewhere, name it in `~/.config/diaspora` (a `diaspora.conf` that
+names its own agent wins):
+
+```
+[agent]
+	command = /opt/claude/bin/claude
+```
+
 `~/.config/diaspora` may also be a directory with a file `config` in it;
 `$XDG_CONFIG_HOME` and `$DIASPORA_CONFIG` are honoured.
 

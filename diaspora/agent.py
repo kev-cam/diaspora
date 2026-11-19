@@ -49,8 +49,8 @@ class Agent:
     def _command(self, mode, schema):
         conf = self.conf
         if conf.protocol == "plain":
-            return conf.command + [mode]
-        cmd = conf.command + ["-p", "--output-format", "json",
+            return conf.argv + [mode]
+        cmd = conf.argv + ["-p", "--output-format", "json",
                               "--json-schema", json.dumps(schema)]
         model = conf.triage_model if mode == "triage" else conf.model
         if model:

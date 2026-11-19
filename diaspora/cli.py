@@ -12,7 +12,7 @@ from . import ledger as L
 from . import tried as T
 from .agent import Agent
 from .config import CONF_NAME, KINDS, LOCAL_NAME, Config
-from .gitutil import DiasporaError, NotARepo, NotYours, Repo
+from .gitutil import DiasporaError, NotARepo, NotYours, Repo, me
 from .session import Session, record
 from .ui import UI
 from .userconf import UserConf
@@ -30,8 +30,17 @@ def make_agent(repo, conf, ui, args):
     agent = Agent(conf.agent, repo.state_dir("logs", "triage"),
                   verbose=getattr(args, "verbose", False), enabled=enabled)
     if enabled and conf.agent.enabled and not conf.agent.found:
-        ui.warn("agent command %r not found: no agent triage, no porting"
-                % conf.agent.command[0])
+        name = conf.agent.command[0]
+        if name == "claude":
+            ui.warn("the agent, Claude Code (`claude`), is not installed for "
+                    "%s: not on PATH, nor in ~/.local/bin.  No agent triage, "
+                    "no porting.  Install it (curl -fsSL "
+                    "https://claude.ai/install.sh | bash) and run `claude` "
+                    "once to log in; or name it in %s: [agent] command = "
+                    "/path/to/claude" % (me() or "you", UserConf.load().source))
+        else:
+            ui.warn("agent command %r not found: no agent triage, no porting"
+                    % name)
     return agent
 
 
