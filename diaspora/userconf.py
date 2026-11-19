@@ -62,12 +62,15 @@ class UserConf:
         return cls(Config.read_entries(where), where)
 
     def remember(self, repo):
-        """Add `repo` (a Repo with a diaspora.conf) if it is not listed.
-        Returns its name here; None if it was not added (or could not be)."""
-        top = repo.top
-        common = repo.common
-        if os.path.basename(common) == ".git":
-            top = os.path.dirname(common)   # a worktree: its main checkout
+        """Add `repo` (a Repo with a diaspora.conf, or the top directory of
+        one that git cannot open for us) if it is not listed.  Returns its
+        name here; None if it was not added (or could not be)."""
+        if isinstance(repo, str):
+            top = repo
+        else:
+            top = repo.top
+            if os.path.basename(repo.common) == ".git":
+                top = os.path.dirname(repo.common)  # a worktree: main checkout
         top = os.path.abspath(top)
         if top in self.repos.values() or not os.path.isfile(
                 os.path.join(top, CONF_NAME)):
@@ -117,6 +120,8 @@ class UserConf:
                 note = "missing"
             elif not os.path.isfile(os.path.join(where, CONF_NAME)):
                 note = "no %s" % CONF_NAME
+            elif not os.access(os.path.join(where, ".git"), os.W_OK):
+                note = "not writable by you"
             else:
                 note = ""
             out.append((name, where, note))

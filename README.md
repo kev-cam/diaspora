@@ -472,6 +472,15 @@ You need not write it: the first time diaspora is used in a repository
 that has a `diaspora.conf` (from inside it, or a worktree of it, or with
 `-C <path>`), it adds the repository under its directory name, making the
 file if there is none, and says so on stderr.
+
+Another user's repository: git refuses to work in a repository owned by
+someone else ("dubious ownership"), and diaspora needs to write to the
+checkout and its `.git` for everything but `status`, `show`, `log` and
+`repos`. diaspora says which it is and stops (it still lists the
+repository). To share one, give it a group you are both in, as root:
+`chgrp -R <group> DIR && chmod -R g+rwX DIR && git -C DIR config
+core.sharedRepository group`, and then, as each other user, `git config
+--global --add safe.directory DIR`.
 `~/.config/diaspora` may also be a directory with a file `config` in it;
 `$XDG_CONFIG_HOME` and `$DIASPORA_CONFIG` are honoured.
 

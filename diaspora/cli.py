@@ -12,7 +12,7 @@ from . import ledger as L
 from . import tried as T
 from .agent import Agent
 from .config import CONF_NAME, KINDS, LOCAL_NAME, Config
-from .gitutil import DiasporaError, Repo
+from .gitutil import DiasporaError, NotARepo, NotYours, Repo
 from .session import Session, record
 from .ui import UI
 from .userconf import UserConf
@@ -465,6 +465,14 @@ def cmd_repos(repo, ui, args):
 
 # commands that need no repository, or that offer a choice of their own
 NO_REPO = ("repos", "gui")
+# commands that write nothing to the repository
+READ_ONLY = ("repos", "status", "show", "log")
+
+
+def note_added(user, added):
+    if added:                         # (not on stdout: --json)
+        print('(added %s to %s as "%s")' % (user.repos[added], user.source,
+                                            added), file=sys.stderr)
 
 
 def open_repo(args, ui):
@@ -482,9 +490,13 @@ def open_repo(args, ui):
         where = found
     try:
         repo = Repo(where)
-    except DiasporaError:
+    except NotYours as exc:
+        # listed all the same: it may be shared with this user later
+        note_added(user, user.remember(exc.top))
+        raise
+    except NotARepo:
         if named or not user.repos:
-            if args.cmd in NO_REPO:
+            if args.cmd in NO_REPO and not named:
                 return None
             raise DiasporaError(
                 "not inside a git repository: %s%s" % (
@@ -494,11 +506,9 @@ def open_repo(args, ui):
         repo = None
     if repo is not None and (named or args.cmd == "init" or os.path.isfile(
             os.path.join(repo.top, CONF_NAME)) or not user.repos):
-        added = user.remember(repo)
-        if added:                     # (not on stdout: --json)
-            print('(added %s to %s as "%s")' % (user.repos[added],
-                                                user.source, added),
-                  file=sys.stderr)
+        note_added(user, user.remember(repo))
+        if args.cmd not in READ_ONLY:
+            repo.check_writable()
         return repo
     # not in a repository diaspora looks after: choose one
     if args.cmd in NO_REPO:
@@ -507,7 +517,10 @@ def open_repo(args, ui):
         name = ui.pick_repo(user.listing(), run_state)
         if name is None:
             raise DiasporaError("no repository chosen")
-        return Repo(user.repos[name])
+        repo = Repo(user.repos[name])
+        if args.cmd not in READ_ONLY:
+            repo.check_writable()
+        return repo
     raise DiasporaError(
         "%s; say which repository with -C NAME: %s" % (
             "no %s here" % CONF_NAME if repo is not None

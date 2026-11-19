@@ -1204,6 +1204,32 @@ class UserConfTests(World):
         with open(path) as handle:
             self.assertEqual(handle.read(), text)
 
+    def test_another_users_repository(self):
+        """git refuses it: say so (even for gui, which must not start
+        without it), and list it all the same."""
+        os.environ["DIASPORA_CONFIG"] = path = os.path.join(self.tmp, "new")
+        with mock.patch.dict(os.environ,
+                             {"GIT_TEST_ASSUME_DIFFERENT_OWNER": "1"}):
+            for args in (["gui", "--no-browser"], ["status"]):
+                self.run_raw("-C", self.ours, *args, code=1)
+                self.assertIn("%s belongs to" % self.ours, self.last_err)
+                self.assertIn("git will not work", self.last_err)
+                self.assertIn("safe.directory", self.last_err)
+        with open(path) as handle:
+            self.assertIn('[repo "ours"]\n\tpath = %s\n' % self.ours,
+                          handle.read())
+
+    @unittest.skipIf(os.geteuid() == 0, "root can write anything")
+    def test_a_repository_we_cannot_write(self):
+        objects = os.path.join(self.ours, ".git", "objects")
+        os.chmod(objects, 0o555)
+        self.addCleanup(os.chmod, objects, 0o755)
+        self.run_raw("-C", "mine", "status", code=0)    # reading is fine
+        self.run_raw("-C", "mine", "fetch", code=1)
+        self.assertIn("you cannot write to %s" % objects, self.last_err)
+        self.run_raw("-C", "mine", "gui", "--no-browser", code=1)
+        self.assertIn("you cannot write", self.last_err)
+
     def test_the_same_name_twice(self):
         os.environ["DIASPORA_CONFIG"] = path = os.path.join(self.tmp, "two")
         with open(path, "w") as handle:

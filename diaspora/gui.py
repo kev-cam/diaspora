@@ -115,7 +115,8 @@ class App:
         if hit[0]["note"]:
             raise DiasporaError("%s: %s" % (name, hit[0]["note"]))
         repo = Repo(hit[0]["path"])
-        Config.load(repo)                   # it must have a diaspora.conf
+        repo.check_writable()
+        Config.load(repo)                  # it must have a diaspora.conf
         self.repo = repo
         self.args.target = None             # (named for the first one only)
         self.args.here = False

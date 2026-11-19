@@ -26,6 +26,46 @@ def run(cmd, cwd=None, check=True, input=None, env=None, timeout=None):
     return proc
 
 
+def owner(path):
+    """The name of the user owning `path` ("" if unknown)."""
+    try:
+        import pwd
+        return pwd.getpwuid(os.stat(path).st_uid).pw_name
+    except (ImportError, KeyError, OSError):
+        return ""
+
+
+def me():
+    try:
+        import pwd
+        return pwd.getpwuid(os.getuid()).pw_name
+    except (ImportError, KeyError, AttributeError):
+        return os.environ.get("USER", "")
+
+
+class NotARepo(DiasporaError):
+    pass
+
+
+class NotYours(DiasporaError):
+    """A repository of another user's that git or diaspora cannot use."""
+
+    def __init__(self, top, why):
+        self.top = top
+        who = owner(top)
+        super().__init__(
+            "%s belongs to %s, not %s: %s.  Run diaspora as %s, or share the "
+            "repository with a group you are both in (as root: chgrp -R "
+            "<group> %s && chmod -R g+rwX %s && git -C %s config "
+            "core.sharedRepository group; then, as you: git config --global "
+            "--add safe.directory %s)" % (
+                top, who or "another user", me() or "you", why,
+                who or "its owner", top, top, top, top))
+
+
+DUBIOUS = re.compile(r"dubious ownership in repository at '([^']+)'")
+
+
 class Repo:
     """A git repository: the checkout diaspora was started in."""
 
@@ -33,13 +73,28 @@ class Repo:
         proc = run(["git", "rev-parse", "--show-toplevel", "--git-common-dir"],
                    cwd=path, check=False)
         if proc.returncode:
-            raise DiasporaError("not inside a git repository: %s"
-                                % os.path.abspath(path))
+            match = DUBIOUS.search(proc.stderr or "")
+            if match:
+                raise NotYours(match.group(1), "git will not work in "
+                               "another user's repository")
+            raise NotARepo("not inside a git repository: %s"
+                           % os.path.abspath(path))
         top, common = proc.stdout.splitlines()[:2]
         self.top = top
         self.common = os.path.normpath(
             os.path.join(os.path.abspath(path), common))
         self.state = os.path.join(self.common, "diaspora")
+
+    def check_writable(self):
+        """Raise NotYours unless this user can write the checkout and its
+        .git (diaspora fetches, commits and keeps its state there)."""
+        bad = [p for p in (self.top, self.common, os.path.join(
+            self.common, "objects"), os.path.join(self.common, "refs"))
+            if os.path.isdir(p) and not os.access(p, os.W_OK)]
+        if os.path.isdir(self.state) and not os.access(self.state, os.W_OK):
+            bad.append(self.state)
+        if bad:
+            raise NotYours(self.top, "you cannot write to %s" % bad[0])
 
     # -- plumbing ---------------------------------------------------------
     def proc(self, *args, cwd=None, check=True, input=None, env=None):
