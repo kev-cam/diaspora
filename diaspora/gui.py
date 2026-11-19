@@ -553,6 +553,13 @@ dialog .head .t { flex: 1; font-weight: 600; overflow: hidden; text-overflow: el
 dialog pre { margin: 0; padding: 12px 14px; font-family: var(--mono); font-size: 12px;
   white-space: pre-wrap; overflow: auto; max-height: calc(88vh - 56px); }
 .err { color: var(--bad); }
+#tip { position: fixed; z-index: 10; max-width: 360px; padding: 8px 10px;
+  background: var(--ink); color: var(--bg); border-radius: 6px;
+  font-size: 12.5px; line-height: 1.45; pointer-events: none;
+  box-shadow: 0 4px 14px rgba(0,0,0,.25); opacity: 0; transition: opacity .1s; }
+#tip.on { opacity: 1; }
+#tip b { font-weight: 600; }
+#tip p { margin: 0 0 5px; } #tip p:last-child { margin: 0; }
 @media (max-width: 760px) {
   .hide-sm { display: none; }
   main, header { padding-left: 16px; padding-right: 16px; }
@@ -590,7 +597,7 @@ dialog pre { margin: 0; padding: 12px 14px; font-family: var(--mono); font-size:
     <span class="status" id="status"></span>
     <button id="logbtn">Output</button>
     <button id="clear">Clear marks</button>
-    <button id="apply" class="primary">Apply</button>
+    <button id="apply" class="primary" data-tip="apply">Apply</button>
   </div>
   <pre id="log"></pre>
 </footer>
@@ -599,6 +606,7 @@ dialog pre { margin: 0; padding: 12px 14px; font-family: var(--mono); font-size:
     <button id="dlgdiff">Diff</button><button id="dlgclose">Close</button></div>
   <pre id="dlgtext"></pre>
 </dialog>
+<div id="tip" role="tooltip"></div>
 <script>
 "use strict";
 const TOKEN = "@TOKEN@";
@@ -638,22 +646,94 @@ function lastTry(c) {
   return lines.join("; ");
 }
 
+// what the buttons do, shown floating over them
+function gate() {
+  return S.tests && S.tests.length ? S.tests.join(" then ") : "the test level";
+}
+function help(what) {
+  const tgt = `<b>${esc(S.target || "the target branch")}</b>`;
+  const later = `<p>Nothing happens until you press <b>Apply</b>; press again to unmark.</p>`;
+  const tip = {
+    accept: `<p><b>Import it.</b> Apply cherry-picks it onto a test branch in
+      diaspora's own workspace (~/.cache/diaspora), not onto ${tgt}. If it does
+      not apply cleanly the agent ports it.</p>
+      <p>Then <b>${esc(gate())}</b> runs: it passes if no test fails that did not
+      fail before the import. ${tgt} changes only when you press
+      <b>Accept: promote</b> afterwards. Nothing is ever pushed.</p>`,
+    retry: `<p><b>Try it again.</b> As Accept: test branch, agent port if it
+      conflicts, <b>${esc(gate())}</b>, then your <b>Accept: promote</b>.</p>
+      <p>The agent is told how the earlier attempts went (from diaspora.log),
+      so it need not repeat them.</p>`,
+    reject: `<p><b>Not wanted here.</b> Apply records it as <i>rejected</i>,
+      with your reason, in diaspora.ledger, committed on ${tgt}.
+      diaspora will not suggest it again.</p>
+      <p>No code changes. To change your mind: <code>diaspora reopen &lt;commit&gt;</code>.</p>`,
+    defer: `<p><b>Not now.</b> Apply records it as <i>deferred</i> in
+      diaspora.ledger, committed on ${tgt}.</p>
+      <p>No code changes. It drops out of the list but is still a candidate:
+      tick “show ignored and deferred” to see it, and Accept it whenever you like.</p>`,
+    apply: `<p>Carries out the marks: <i>reject</i> and <i>defer</i> are recorded
+      in diaspora.ledger on ${tgt}; <i>accept</i> and <i>retry</i> start one
+      import run (test branch, <b>${esc(gate())}</b>).</p>
+      <p>${tgt} itself changes only when you press <b>Accept: promote</b>
+      on the finished run.</p>`,
+  }[what];
+  const wait = what === "apply" && S.run ?
+    `<p><b>Finish the run above first</b> (promote it or drop it).</p>` : "";
+  return tip ? wait + tip + (what === "apply" ? "" : later) : "";
+}
+let tipFor = null, tipTimer = 0;
+function showTip(el) {
+  const t = $("tip"), html = help(el.dataset.tip);
+  if (!html || !el.isConnected) return;
+  t.innerHTML = html;
+  const r = el.getBoundingClientRect(), w = t.offsetWidth, h = t.offsetHeight;
+  let x = Math.min(Math.max(8, r.left + r.width / 2 - w / 2), innerWidth - w - 8);
+  let y = r.top - h - 8;
+  if (y < 8) y = r.bottom + 8;                 // no room above: below
+  t.style.left = x + "px"; t.style.top = y + "px";
+  t.classList.add("on");
+}
+function hideTip() { clearTimeout(tipTimer); tipFor = null; $("tip").classList.remove("on"); }
+function tipOn(ev) {
+  const el = ev.target.closest && ev.target.closest("[data-tip]");
+  if (el === tipFor) return;
+  hideTip();
+  if (!el) return;
+  tipFor = el;
+  tipTimer = setTimeout(() => tipFor && showTip(tipFor), ev.type === "focusin" ? 0 : 250);
+}
+document.addEventListener("mouseover", tipOn);
+document.addEventListener("focusin", tipOn);
+document.addEventListener("focusout", hideTip);
+document.addEventListener("scroll", hideTip, true);
+document.addEventListener("keydown", ev => { if (ev.key === "Escape") hideTip(); });
+
+// redraw only what changed: a redraw every poll would lose the focus, the
+// tip over a button and what was ticked
+const drawn = new WeakMap();
+function setHTML(el, html) {
+  if (drawn.get(el) === html) return;
+  drawn.set(el, html);
+  el.innerHTML = html;
+}
+
 function renderRows() {
   const all = $("showall").checked, peer = $("peer").value;
   const busy = S.busy, blocked = S.busy || !!S.run;
   const list = S.commits.filter(c => (all || (c.disposition !== "ignore" &&
     c.status !== "deferred") || c.mark) && (!peer || c.peer === peer));
-  if (!S.scanned) { $("rows").innerHTML =
-    '<tr><td colspan="6" class="dim">scanning ...</td></tr>'; return; }
-  if (!list.length) { $("rows").innerHTML =
+  if (!S.scanned) { setHTML($("rows"),
+    '<tr><td colspan="6" class="dim">scanning ...</td></tr>'); return; }
+  if (!list.length) { setHTML($("rows"),
     '<tr><td colspan="6" class="dim">Nothing to import' +
-    (all ? "" : " (tick “show ignored and deferred” for the rest)") + '.</td></tr>'; return; }
+    (all ? "" : " (tick “show ignored and deferred” for the rest)") + '.</td></tr>'); return; }
   const multi = S.peers.length > 1;
-  $("rows").innerHTML = list.map(c => {
+  setHTML($("rows"), list.map(c => {
     const again = c.status === "failed" || c.tried.length;
     const opts = again ? ["retry", "reject", "defer"] : ["accept", "reject", "defer"];
     const btns = opts.map(m => `<button class="${m}${c.mark === m ? " on" : ""}"
-      data-sha="${c.commit}" data-mark="${m}" ${busy ? "disabled" : ""}>${
+      data-sha="${c.commit}" data-mark="${m}" data-tip="${m}" ${busy ? "disabled" : ""}>${
       m[0].toUpperCase() + m.slice(1)}</button>`).join(" ");
     const agent = c.triage === "agent" ? `agent${c.risk ? ", risk " + esc(c.risk) : ""}: ${
       esc(c.reason || c.summary)}` : (c.why && c.status === "pending" &&
@@ -669,12 +749,11 @@ function renderRows() {
         ${t ? `<div class="tried">${esc(t)}</div>` : ""}
         ${c.why_mark ? `<div class="note">why: ${esc(c.why_mark)}</div>` : ""}</td>
       <td class="acts">${btns}</td></tr>`;
-  }).join("");
+  }).join(""));
   const n = m => S.commits.filter(c => c.mark === m).length;
   $("counts").textContent = `${list.length} shown of ${S.commits.length}`;
   const a = n("accept") + n("retry"), r = n("reject"), d = n("defer");
   $("apply").disabled = blocked || !(a + r + d);
-  $("apply").title = S.run ? "finish the run first (accept or drop it)" : "";
   $("apply").textContent = a ? `Import ${a}` + (r + d ? `, record ${r + d}` : "") :
     (r + d ? `Record ${r + d}` : "Apply");
   $("clear").disabled = busy || !(a + r + d);
@@ -704,11 +783,11 @@ function renderRun() {
      <button class="danger" data-run="abort">Drop the run</button>`;
   if (acts.includes('data-run="abort"')) acts +=
     ` <label class="dim"><input type="checkbox" id="keeplog" checked> keep what did not work in diaspora.log</label>`;
-  el.innerHTML = `<h2>Run ${esc(R.id)} <span class="dim">· ${stage} · branch ${esc(R.branch)}</span></h2>
+  setHTML(el, `<h2>Run ${esc(R.id)} <span class="dim">· ${stage} · branch ${esc(R.branch)}</span></h2>
     <div class="items">${R.items.map(i => `<div><span class="st-${esc(i.state)}">${
       esc(i.state.padEnd(9))}</span> ${esc(i.sha.slice(0, 10))} ${esc(i.subject)}${
       i.note ? ` <span class="dim">— ${esc(i.note)}</span>` : ""}</div>`).join("")}</div>
-    <div class="actions">${acts}</div>`;
+    <div class="actions">${acts}</div>`);
 }
 
 function renderRepos() {
@@ -737,6 +816,17 @@ function renderRepos() {
 
 function render() {
   renderRepos();
+  try { renderAll(); } finally { retip(); }
+}
+// the rows are drawn afresh: keep the tip on the button now in their place
+function retip() {
+  if (!tipFor || tipFor.isConnected) return;
+  const sha = tipFor.dataset.sha, what = tipFor.dataset.tip;
+  const now = [...document.querySelectorAll("[data-tip]")].find(b =>
+    b.dataset.tip === what && b.dataset.sha === sha);
+  if (now && now.matches(":hover")) tipFor = now; else hideTip();
+}
+function renderAll() {
   if (!S.repo) {
     $("where").textContent = "";
     $("status").textContent = S.job && S.job.error ? S.job.error : "";
