@@ -47,20 +47,78 @@ class NotARepo(DiasporaError):
     pass
 
 
+def group_of(path):
+    """(group name, whether this process is in it, whether this user is
+    listed in it in the group database) for `path`'s group."""
+    try:
+        gid = os.stat(path).st_gid
+    except OSError:
+        return "", False, False
+    name, listed = str(gid), False
+    try:
+        import grp
+        entry = grp.getgrgid(gid)
+        name, listed = entry.gr_name, me() in entry.gr_mem
+    except (ImportError, KeyError):
+        pass
+    return name, gid in os.getgroups() or gid == os.getegid(), listed
+
+
+def shared_with_me(top):
+    """Whether `top`, a repository of another user's, is shared with this
+    one: its group is ours and we may write the checkout and its .git.
+    Such a repository is as much ours as theirs, so git's ownership check
+    (which keeps a stranger's hooks and config away from us) is moot."""
+    _, member, _ = group_of(top)
+    if not member:
+        return False
+    for where in (top, os.path.join(top, ".git")):
+        try:
+            if os.path.isdir(where) and not os.stat(where).st_mode & 0o020:
+                return False            # (the group may not write it)
+        except OSError:
+            return False
+    return True
+
+
+def trust(path):
+    """Tell git (ours and every child's) that `path` is safe, as
+    `git config --global --add safe.directory` would, for this run only."""
+    count = int(os.environ.get("GIT_CONFIG_COUNT", "0") or 0)
+    for i in range(count):
+        if (os.environ.get("GIT_CONFIG_KEY_%d" % i) == "safe.directory" and
+                os.environ.get("GIT_CONFIG_VALUE_%d" % i) == path):
+            return False
+    os.environ["GIT_CONFIG_KEY_%d" % count] = "safe.directory"
+    os.environ["GIT_CONFIG_VALUE_%d" % count] = path
+    os.environ["GIT_CONFIG_COUNT"] = str(count + 1)
+    return True
+
+
 class NotYours(DiasporaError):
     """A repository of another user's that git or diaspora cannot use."""
 
     def __init__(self, top, why):
         self.top = top
-        who = owner(top)
-        super().__init__(
-            "%s belongs to %s, not %s: %s.  Run diaspora as %s, or share the "
-            "repository with a group you are both in (as root: chgrp -R "
-            "<group> %s && chmod -R g+rwX %s && git -C %s config "
-            "core.sharedRepository group; then, as you: git config --global "
-            "--add safe.directory %s)" % (
-                top, who or "another user", me() or "you", why,
-                who or "its owner", top, top, top, top))
+        who, user = owner(top) or "another user", me() or "you"
+        group, member, listed = group_of(top)
+        head = "%s belongs to %s, not %s: %s." % (top, who, user, why)
+        if listed and not member:
+            fix = ("It is shared with group %s, which %s joined after "
+                   "logging in: log out and in again (or run `newgrp %s`)."
+                   % (group, user, group))
+        elif member:
+            fix = ("It is in your group %s but not writable by the group; "
+                   "%s (or root) can fix that: chmod -R g+rwX %s && find %s "
+                   "-type d -exec chmod g+s {} + && git -C %s config "
+                   "core.sharedRepository group"
+                   % (group, who, top, top, top))
+        else:
+            fix = ("Run diaspora as %s, or share the repository with a "
+                   "group you are both in (as root: chgrp -R <group> %s && "
+                   "chmod -R g+rwX %s && git -C %s config "
+                   "core.sharedRepository group)." % (who, top, top, top))
+        super().__init__(head + "  " + fix)
 
 
 DUBIOUS = re.compile(r"dubious ownership in repository at '([^']+)'")
@@ -70,13 +128,17 @@ class Repo:
     """A git repository: the checkout diaspora was started in."""
 
     def __init__(self, path="."):
-        proc = run(["git", "rev-parse", "--show-toplevel", "--git-common-dir"],
-                   cwd=path, check=False)
+        for _ in range(4):
+            proc = run(["git", "rev-parse", "--show-toplevel",
+                        "--git-common-dir"], cwd=path, check=False)
+            match = proc.returncode and DUBIOUS.search(proc.stderr or "")
+            if not match:
+                break
+            where = match.group(1)
+            if not (shared_with_me(where) and trust(where)):
+                raise NotYours(where, "git will not work in another "
+                               "user's repository")
         if proc.returncode:
-            match = DUBIOUS.search(proc.stderr or "")
-            if match:
-                raise NotYours(match.group(1), "git will not work in "
-                               "another user's repository")
             raise NotARepo("not inside a git repository: %s"
                            % os.path.abspath(path))
         top, common = proc.stdout.splitlines()[:2]

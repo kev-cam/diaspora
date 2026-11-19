@@ -476,11 +476,15 @@ file if there is none, and says so on stderr.
 Another user's repository: git refuses to work in a repository owned by
 someone else ("dubious ownership"), and diaspora needs to write to the
 checkout and its `.git` for everything but `status`, `show`, `log` and
-`repos`. diaspora says which it is and stops (it still lists the
-repository). To share one, give it a group you are both in, as root:
-`chgrp -R <group> DIR && chmod -R g+rwX DIR && git -C DIR config
-core.sharedRepository group`, and then, as each other user, `git config
---global --add safe.directory DIR`.
+`repos`. To share one, give it a group you are both in, as root:
+`chgrp -R <group> DIR && chmod -R g+rwX DIR && find DIR -type d -exec
+chmod g+s {} + && git -C DIR config core.sharedRepository group`. A
+repository in one of your groups that the group may write is as much
+yours as its owner's, so diaspora tells git it is safe (for its own run
+and what it starts; your git config is not changed: for git by hand, add
+it with `git config --global --add safe.directory DIR`). Otherwise
+diaspora says what is missing (including "you joined the group after
+logging in") and stops, still listing the repository.
 `~/.config/diaspora` may also be a directory with a file `config` in it;
 `$XDG_CONFIG_HOME` and `$DIASPORA_CONFIG` are honoured.
 

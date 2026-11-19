@@ -18,7 +18,7 @@ from unittest import mock
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
-from diaspora import cli, scan, triage                      # noqa: E402
+from diaspora import cli, gitutil, scan, triage             # noqa: E402
 from diaspora import ledger as L                            # noqa: E402
 from diaspora import tried as T                             # noqa: E402
 from diaspora.agent import Agent, _json_object              # noqa: E402
@@ -1208,16 +1208,44 @@ class UserConfTests(World):
         """git refuses it: say so (even for gui, which must not start
         without it), and list it all the same."""
         os.environ["DIASPORA_CONFIG"] = path = os.path.join(self.tmp, "new")
+        os.chmod(self.ours, 0o755)          # not shared with our group
+        self.addCleanup(os.chmod, self.ours, 0o775)
         with mock.patch.dict(os.environ,
                              {"GIT_TEST_ASSUME_DIFFERENT_OWNER": "1"}):
             for args in (["gui", "--no-browser"], ["status"]):
                 self.run_raw("-C", self.ours, *args, code=1)
                 self.assertIn("%s belongs to" % self.ours, self.last_err)
                 self.assertIn("git will not work", self.last_err)
-                self.assertIn("safe.directory", self.last_err)
+                self.assertIn("not writable by the group", self.last_err)
+            # in a group of ours we were added to after logging in
+            with mock.patch.object(gitutil, "group_of",
+                                   return_value=("dev", False, True)):
+                self.run_raw("-C", self.ours, "status", code=1)
+                self.assertIn("log out and in again", self.last_err)
+            # in a group of no concern to us
+            with mock.patch.object(gitutil, "group_of",
+                                   return_value=("staff", False, False)):
+                self.run_raw("-C", self.ours, "status", code=1)
+                self.assertIn("share the repository with a group",
+                              self.last_err)
         with open(path) as handle:
             self.assertIn('[repo "ours"]\n\tpath = %s\n' % self.ours,
                           handle.read())
+
+    def test_another_users_repository_shared_with_us(self):
+        """In a group of ours, and group-writable: git is told it is safe
+        (for diaspora and what it runs, not in the user's git config)."""
+        os.chmod(self.ours, 0o775)
+        os.chmod(os.path.join(self.ours, ".git"), 0o775)
+        with mock.patch.dict(os.environ,
+                             {"GIT_TEST_ASSUME_DIFFERENT_OWNER": "1"}):
+            out = self.run_raw("-C", self.ours, "status", code=0)
+            self.assertIn("Peer up:", out)
+            self.assertEqual(os.environ.get("GIT_CONFIG_VALUE_0"),
+                             self.ours)
+            gitutil.Repo(self.ours)          # trusted once, not twice
+            self.assertEqual(os.environ["GIT_CONFIG_COUNT"], "1")
+        self.assertNotIn("GIT_CONFIG_COUNT", os.environ)
 
     @unittest.skipIf(os.geteuid() == 0, "root can write anything")
     def test_a_repository_we_cannot_write(self):
