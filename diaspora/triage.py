@@ -10,7 +10,7 @@ answers are cached in .git/diaspora/triage.json.
 import json
 import os
 import re
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .config import KINDS
 from .gitutil import PathSet
@@ -182,11 +182,14 @@ def _apply(commit, answer):
 
 
 def triage(repo, conf, peer, target, commits, agent=None, say=None,
-           direction="import", ask=True):
+           direction="import", ask=True, progress=None):
     """Classify `commits` in place and set each one's disposition.
 
     Earlier agent answers are always used; the agent is asked about the
-    rest only if `ask` is set.
+    rest only if `ask` is set.  `progress()`, if given, is called once
+    every commit has a disposition from its message alone (those the agent
+    is about to read have `asking` set), and again each time the agent's
+    answer for some of them is in.
     """
     for commit in commits:
         commit.kind, commit.confidence = classify(commit)
@@ -226,22 +229,40 @@ def triage(repo, conf, peer, target, commits, agent=None, say=None,
         if batches and say:
             say("triage: asking the agent about %d commit%s from %s ..." % (
                 len(todo), "" if len(todo) == 1 else "s", peer.name))
+        for commit in todo:
+            commit.asking = True
+        if progress:
+            for commit in commits:
+                decide(conf, peer, commit, direction)
+            progress()
         failed = 0
         with ThreadPoolExecutor(max_workers=max(
                 1, conf.agent.triage_jobs)) as pool:
-            for batch, answer in zip(batches, pool.map(question, batches)):
+            jobs = {pool.submit(question, batch): batch for batch in batches}
+            for job in as_completed(jobs):     # as each answer comes in
+                batch = jobs[job]
+                try:
+                    answer = job.result()
+                except Exception:              # (ask() catches its own)
+                    answer = None
+                for commit in batch:
+                    commit.asking = False
                 if not answer:
                     failed += len(batch)
-                    continue
-                for item in answer.get("commits", []):
-                    sha = str(item.get("sha", ""))
-                    match = by_sha.get(sha) or next(
-                        (c for c in batch if sha and c.sha.startswith(sha)),
-                        None)
-                    if match:
-                        _apply(match, item)
-                        cache.data[match.sha] = item
-                cache.save()
+                else:
+                    for item in answer.get("commits", []):
+                        sha = str(item.get("sha", ""))
+                        match = by_sha.get(sha) or next(
+                            (c for c in batch
+                             if sha and c.sha.startswith(sha)), None)
+                        if match:
+                            _apply(match, item)
+                            cache.data[match.sha] = item
+                    cache.save()
+                if progress:
+                    for commit in batch:
+                        decide(conf, peer, commit, direction)
+                    progress()
         if failed and say:
             say("triage: no usable answer from the agent for %d commit%s "
                 "(%s); the message heuristics stand" % (

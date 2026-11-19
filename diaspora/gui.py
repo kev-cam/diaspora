@@ -87,6 +87,7 @@ class App:
         self.commits = []           # the last scan
         self.scanned = None
         self.marks = {}             # sha -> mark
+        self.reading = 0            # commits the agent is reading
         self.notes = {}             # sha -> why (for reject and defer)
         self.agent_cost = 0.0
         self.fetch = not getattr(args, "no_fetch", False)
@@ -192,9 +193,26 @@ class App:
         agent = self.agent(conf)
         target = self.target(conf)
         opts = argparse.Namespace(no_fetch=not fetch, json=False, pick=None)
-        found = self.cli.gather(self.repo, conf, self.ui, agent,
-                                self.cli.pick_peers(conf, self.args.peers),
-                                target, opts)
+        old, seen = list(self.commits), {}
+
+        def progress(peer, commits):
+            # the page lists what is read so far (the other peers as they
+            # were until their turn comes)
+            seen[peer.name] = list(commits)
+            self.commits = [c for got in seen.values() for c in got] + [
+                c for c in old if c.peer not in seen]
+            self.reading = sum(c.asking for c in self.commits)
+
+        self.reading = 0
+        try:
+            found = self.cli.gather(
+                self.repo, conf, self.ui, agent,
+                self.cli.pick_peers(conf, self.args.peers), target, opts,
+                progress=progress)
+        finally:
+            self.reading = 0
+            for commit in self.commits:
+                commit.asking = False
         for peer, commits, dropped in found:
             self.cli.summarize(self.ui, peer, commits, dropped, "import")
         self.commits = [c for _p, commits, _d in found for c in commits]
@@ -297,6 +315,7 @@ class App:
                                                 "bugfix")),
             "strategy": conf.strategy,
             "scanned": self.scanned, "commits": commits, "run": run,
+            "reading": self.reading,
             "job": dict(self.job) if self.job else None,
             "busy": self.busy(), "log": lines, "log_count": count,
             "agent_cost": round(self.agent_cost, 2),
@@ -535,6 +554,7 @@ td.acts button.on.defer { background: var(--defer); color: var(--on-ink); border
 .badge[data-tip] { cursor: help; }
 .badge.failed { color: var(--bad); border-color: var(--bad); }
 .badge.suggested { color: var(--ok); border-color: var(--ok); }
+.badge.asking { color: var(--accent); border-color: var(--accent); border-style: dashed; }
 .badge.deferred { color: var(--defer); border-color: var(--defer); }
 .dim { color: var(--dim); }
 .st-done { color: var(--ok); } .st-failed { color: var(--bad); }
@@ -636,6 +656,7 @@ async function act(path, body) {
 
 function label(c) {
   const b = (cls, text) => `<span class="badge ${cls}" tabindex="0" data-tip="badge" data-sha="${c.commit}">${text}</span>`;
+  if (c.asking) return b("asking", "agent reading …");
   if (c.status === "failed") return b("failed", "failed before");
   if (c.tried.length) return b("failed", "tried before");
   if (c.status === "deferred") return b("deferred", "deferred");
@@ -655,6 +676,11 @@ function badgeHelp(c) {
     <b>${esc(c.kind)}</b>; from ${esc(c.peer)} it imports <b>${esc(kinds)}</b>
     by default (<code>import =</code> in diaspora.conf).</p>`;
   const pick = `<p>Labels only advise: nothing is marked until you press a button.</p>`;
+  if (c.asking) return `<p><b>The agent is reading it.</b> Its message
+    did not make clear enough what it is, so diaspora asked the agent (in a
+    batch with others: <code>agent.triage-batch</code>). Until the answer is
+    in, it is sorted by its message alone: <b>${esc(c.kind)}</b>.</p>
+    <p>You can mark it already; the label changes when the agent answers.</p>`;
   if (c.status === "failed") return `<p><b>Failed before.</b> An earlier import
     of this commit did not pass (conflict or new test failures); the ledger
     holds it as <i>failed</i>${c.note ? ": " + esc(c.note) : ""}.</p>
@@ -766,10 +792,14 @@ function setHTML(el, html) {
 
 function renderRows() {
   const all = $("showall").checked, peer = $("peer").value;
-  const busy = S.busy, blocked = S.busy || !!S.run;
+  // marking goes on while a scan fills the list; not while a run works
+  const scanning = S.busy && S.job && /scan/.test(S.job.name);
+  const busy = S.busy && !scanning, blocked = S.busy || !!S.run;
   const list = S.commits.filter(c => (all || (c.disposition !== "ignore" &&
     c.status !== "deferred") || c.mark) && (!peer || c.peer === peer));
-  if (!S.scanned) { setHTML($("rows"),
+  if (!S.scanned && !S.commits.length) { setHTML($("rows"),
+    '<tr><td colspan="6" class="dim">scanning ...</td></tr>'); return; }
+  if (!list.length && scanning) { setHTML($("rows"),
     '<tr><td colspan="6" class="dim">scanning ...</td></tr>'); return; }
   if (!list.length) { setHTML($("rows"),
     '<tr><td colspan="6" class="dim">Nothing to import' +
@@ -892,6 +922,7 @@ function renderAll() {
     `${j.name} … ${Math.round(Date.now() / 1000 - j.started)}s`) : "";
   if (S.run && !S.busy && S.run.stage !== "ready")
     st = (st ? st + " · " : "") + "a run is waiting";
+  if (S.reading) st += ` · the agent is reading ${S.reading} commit${S.reading > 1 ? "s" : ""}`;
   if (S.agent_cost) st += ` · agent $${S.agent_cost.toFixed(2)}`;
   $("status").textContent = st;
   $("status").className = "status" + (j && j.error ? " err" : "");

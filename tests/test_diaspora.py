@@ -429,6 +429,38 @@ class ImportTests(World):
         self.assertIn("tried before (diaspora.log)", out)
         self.assertIn("test regress failed", out)
 
+    def test_triage_reports_progress(self):
+        """The list can be shown before the agent has answered, and is
+        updated as each batch's answer comes in."""
+        self.use_fake_agent("\ttriage = all\n\ttriage-batch = 1\n"
+                            "\ttriage-jobs = 1\n")
+        os.environ["FAKE_TRIAGE"] = json.dumps(
+            {"Add x": {"kind": "feature", "recommend": "review"}})
+        repo = Repo(self.ours)
+        conf = Config.load(repo)
+        ui = mock.Mock()
+        agent = cli.make_agent(repo, conf, ui, argparse.Namespace(
+            no_agent=False, verbose=False))
+        seen = []
+
+        def progress(peer, commits):
+            seen.append((len(commits), sum(c.asking for c in commits),
+                         sum(c.source == "agent" for c in commits)))
+
+        found = cli.gather(repo, conf, ui, agent, list(conf.peers.values()),
+                           "main", argparse.Namespace(no_fetch=False),
+                           progress=progress)
+        commits = found[0][1]
+        n = len(commits)
+        self.assertGreater(n, 1)
+        # first: all there, all being read, none answered; then one more
+        # answered per batch; last: the final word
+        self.assertEqual(seen[0], (n, n, 0))
+        self.assertEqual(seen[1:n + 1],
+                         [(n, n - i, i) for i in range(1, n + 1)])
+        self.assertEqual(seen[-1], (n, 0, n))
+        self.assertFalse(any(c.asking for c in commits))
+
     def test_agent_ports_and_fixes(self):
         self.use_fake_agent()
         os.environ["FAKE_TRIAGE"] = json.dumps({

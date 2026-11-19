@@ -42,6 +42,7 @@ class Commit:
     note: str = ""
     disposition: str = "review"      # import | review | ignore
     why: str = ""
+    asking: bool = False             # the agent is reading it right now
 
     @property
     def paths(self):
@@ -69,7 +70,7 @@ class Commit:
             "relevant": self.relevant, "depends": self.depends,
             "status": self.status, "note": self.note,
             "disposition": self.disposition, "why": self.why,
-            "absent": self.absent,
+            "absent": self.absent, "asking": self.asking,
             "added": self.added, "deleted": self.deleted,
             "files": self.paths,
         }

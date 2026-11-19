@@ -64,8 +64,11 @@ def pick_peers(conf, names):
         else list(conf.peers.values())
 
 
-def gather(repo, conf, ui, agent, peers, target, args, direction="import"):
-    """Fetch, scan and triage; returns [(peer, commits, dropped)]."""
+def gather(repo, conf, ui, agent, peers, target, args, direction="import",
+           progress=None):
+    """Fetch, scan and triage; returns [(peer, commits, dropped)].
+    `progress(peer, commits)`, if given, hears of each peer's commits as
+    soon as they are read, and again as the agent answers for them."""
     ledger = L.Ledger.at(repo, target, conf.ledger)
     quiet = getattr(args, "json", False)
     out = []
@@ -78,9 +81,15 @@ def gather(repo, conf, ui, agent, peers, target, args, direction="import"):
         finder = scan.import_candidates if direction == "import" \
             else scan.export_candidates
         commits, dropped = finder(repo, conf, peer, target, ledger)
+        tell = None
+        if progress:
+            def tell(peer=peer, commits=commits):
+                progress(peer, commits)
         triage.triage(repo, conf, peer, target, commits, agent,
                       None if quiet else ui.say, direction,
-                      ask=not getattr(args, "pick", None))
+                      ask=not getattr(args, "pick", None), progress=tell)
+        if progress:
+            progress(peer, commits)
         out.append((peer, commits, dropped))
     return out
 
