@@ -289,7 +289,9 @@ class App:
         return {
             "repo": self.repo.top, "target": target,
             "head": self.repo.rev(target)[:10],
-            "peers": [{"name": p.name, "url": p.url, "branch": p.branch}
+            "peers": [{"name": p.name, "url": p.url, "branch": p.branch,
+                       "imports": list(p.imports), "ignore": list(p.ignore),
+                       "max_lines": p.max_lines}
                       for p in conf.peers.values()],
             "tests": conf.chain(conf.levels_for(next(iter(conf.peers), ""),
                                                 "bugfix")),
@@ -530,6 +532,7 @@ td.acts button.on.defer { background: var(--defer); color: var(--on-ink); border
 .badge { display: inline-block; font-size: 11.5px; padding: 0 6px;
   border-radius: 9px; border: 1px solid var(--line); color: var(--dim);
   margin-left: 4px; white-space: nowrap; }
+.badge[data-tip] { cursor: help; }
 .badge.failed { color: var(--bad); border-color: var(--bad); }
 .badge.suggested { color: var(--ok); border-color: var(--ok); }
 .badge.deferred { color: var(--defer); border-color: var(--defer); }
@@ -632,12 +635,51 @@ async function act(path, body) {
 }
 
 function label(c) {
-  if (c.status === "failed") return '<span class="badge failed">failed before</span>';
-  if (c.tried.length) return '<span class="badge failed">tried before</span>';
-  if (c.status === "deferred") return '<span class="badge deferred">deferred</span>';
-  if (c.disposition === "import") return '<span class="badge suggested">suggested</span>';
-  if (c.disposition === "ignore") return '<span class="badge">ignored</span>';
-  return '<span class="badge">review</span>';
+  const b = (cls, text) => `<span class="badge ${cls}" tabindex="0" data-tip="badge" data-sha="${c.commit}">${text}</span>`;
+  if (c.status === "failed") return b("failed", "failed before");
+  if (c.tried.length) return b("failed", "tried before");
+  if (c.status === "deferred") return b("deferred", "deferred");
+  if (c.disposition === "import") return b("suggested", "suggested");
+  if (c.disposition === "ignore") return b("", "ignored");
+  return b("", "review");
+}
+// why a commit got its label (triage.decide), for the tip over it
+function badgeHelp(c) {
+  const P = S.peers.find(p => p.name === c.peer) || {imports: [], ignore: []};
+  const kinds = P.imports.length ? P.imports.join(", ") : "none";
+  const agent = c.triage === "agent";
+  const said = agent && (c.reason || c.summary) ?
+    `<p>The agent: “${esc(c.reason || c.summary)}”</p>` : "";
+  const how = `<p>diaspora sorts each commit by its kind (read from the message${
+    agent ? ", and here also by asking the agent" : ""}). This one is
+    <b>${esc(c.kind)}</b>; from ${esc(c.peer)} it imports <b>${esc(kinds)}</b>
+    by default (<code>import =</code> in diaspora.conf).</p>`;
+  const pick = `<p>Labels only advise: nothing is marked until you press a button.</p>`;
+  if (c.status === "failed") return `<p><b>Failed before.</b> An earlier import
+    of this commit did not pass (conflict or new test failures); the ledger
+    holds it as <i>failed</i>${c.note ? ": " + esc(c.note) : ""}.</p>
+    <p>It stays in the list so you can <b>Retry</b> (the agent is told what went
+    wrong), Reject or Defer it.</p>`;
+  if (c.tried.length) return `<p><b>Tried before.</b> diaspora.log has
+    ${c.tried.length} earlier attempt${c.tried.length > 1 ? "s" : ""} at this
+    commit that did not work out; the last one is summed up in red below the
+    subject.</p><p><b>Retry</b> tells the agent about them.</p>`;
+  if (c.status === "deferred") return `<p><b>Deferred.</b> Someone chose
+    <i>Defer</i> for it earlier, so the ledger says “ask again later”. It is
+    hidden unless “show ignored and deferred” is ticked.</p>
+    <p>Accept, Reject or Defer it again as you like.</p>`;
+  if (c.disposition === "import") return `<p><b>Suggested.</b> diaspora
+    would import this one: its kind is one imported by default, it is not too
+    big${P.max_lines ? " (" + P.max_lines + " lines)" : ""}, and it does not touch
+    code marked as rewritten here${agent ? ", and the agent sees no reason not to" : ""}.</p>
+    ${how}${said}${pick}`;
+  if (c.disposition === "ignore") return `<p><b>Ignored.</b> Not worth
+    importing, it seems: ${esc(c.why || "")}.</p>
+    <p>Hidden unless “show ignored and deferred” is ticked; you can still
+    Accept it.</p>${said}`;
+  return `<p><b>Review.</b> Neither suggested nor ignored: a person should
+    decide. Here because ${esc(c.why || "the rules do not decide it")}.</p>
+    ${how}${said}${pick}`;
 }
 function lastTry(c) {
   if (!c.tried.length) return c.status === "failed" ? c.note : "";
@@ -650,7 +692,11 @@ function lastTry(c) {
 function gate() {
   return S.tests && S.tests.length ? S.tests.join(" then ") : "the test level";
 }
-function help(what) {
+function help(what, el) {
+  if (what === "badge") {
+    const c = S.commits.find(x => x.commit === (el && el.dataset.sha));
+    return c ? badgeHelp(c) : "";
+  }
   const tgt = `<b>${esc(S.target || "the target branch")}</b>`;
   const later = `<p>Nothing happens until you press <b>Apply</b>; press again to unmark.</p>`;
   const tip = {
@@ -684,7 +730,7 @@ function help(what) {
 }
 let tipFor = null, tipTimer = 0;
 function showTip(el) {
-  const t = $("tip"), html = help(el.dataset.tip);
+  const t = $("tip"), html = help(el.dataset.tip, el);
   if (!html || !el.isConnected) return;
   t.innerHTML = html;
   const r = el.getBoundingClientRect(), w = t.offsetWidth, h = t.offsetHeight;
