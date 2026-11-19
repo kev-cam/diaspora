@@ -677,10 +677,10 @@ function badgeHelp(c) {
     by default (<code>import =</code> in diaspora.conf).</p>`;
   const pick = `<p>Labels only advise: nothing is marked until you press a button.</p>`;
   if (c.asking) return `<p><b>The agent is reading it.</b> Its message
-    did not make clear enough what it is, so diaspora asked the agent (in a
-    batch with others: <code>agent.triage-batch</code>). Until the answer is
-    in, it is sorted by its message alone: <b>${esc(c.kind)}</b>.</p>
-    <p>You can mark it already; the label changes when the agent answers.</p>`;
+    did not make clear enough what it is, so diaspora asked the agent. Until the
+    answer is in, it is sorted by its message alone: <b>${esc(c.kind)}</b>.</p>
+    <p>The answer is kept, so it is never asked about again. You can mark it
+    already; the label changes when the agent answers.</p>`;
   if (c.status === "failed") return `<p><b>Failed before.</b> An earlier import
     of this commit did not pass (conflict or new test failures); the ledger
     holds it as <i>failed</i>${c.note ? ": " + esc(c.note) : ""}.</p>

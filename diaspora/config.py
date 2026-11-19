@@ -106,7 +106,7 @@ class AgentConf:
     port: bool = True
     model: str = None
     triage_model: str = None
-    triage_batch: int = 20
+    triage_batch: int = 1
     triage_max: int = 100
     triage_jobs: int = 4
     timeout: float = 1800.0
@@ -380,7 +380,7 @@ class Config:
             port=parse_bool(one(a, "", "port", "true"), "agent.port"),
             model=one(a, "", "model"),
             triage_model=one(a, "", "triage-model"),
-            triage_batch=int(one(a, "", "triage-batch", "20")),
+            triage_batch=int(one(a, "", "triage-batch", "1")),
             triage_max=int(one(a, "", "triage-max", "100")),
             triage_jobs=int(one(a, "", "triage-jobs", "4")),
             timeout=parse_duration(one(a, "", "timeout", "30m"),

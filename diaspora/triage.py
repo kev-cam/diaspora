@@ -153,18 +153,29 @@ def _describe(commit):
 
 
 class Cache:
+    """The agent's triage answers, by commit: a commit it has read is not
+    sent to it again.  Saved after every answer; several diaspora runs
+    (users sharing the repository) may add to it at once."""
+
     def __init__(self, repo):
         self.path = os.path.join(repo.state_dir(), "triage.json")
+        self.data = self._read()
+
+    def _read(self):
         try:
             with open(self.path, encoding="utf-8") as handle:
-                self.data = json.load(handle)
+                data = json.load(handle)
+            return data if isinstance(data, dict) else {}
         except (OSError, ValueError):
-            self.data = {}
+            return {}
 
     def save(self):
-        tmp = self.path + ".tmp"
+        data = self._read()               # what others added meanwhile
+        data.update(self.data)
+        self.data = data
+        tmp = "%s.%d.tmp" % (self.path, os.getpid())
         with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump(self.data, handle, indent=0, sort_keys=True)
+            json.dump(data, handle, indent=0, sort_keys=True)
         os.replace(tmp, self.path)
 
 

@@ -443,9 +443,15 @@ class ImportTests(World):
             no_agent=False, verbose=False))
         seen = []
 
+        cache = os.path.join(self.ours, ".git", "diaspora", "triage.json")
+
         def progress(peer, commits):
+            answered = sum(c.source == "agent" for c in commits)
             seen.append((len(commits), sum(c.asking for c in commits),
-                         sum(c.source == "agent" for c in commits)))
+                         answered))
+            if answered:                # each answer is kept at once
+                with open(cache) as handle:
+                    self.assertEqual(len(json.load(handle)), answered)
 
         found = cli.gather(repo, conf, ui, agent, list(conf.peers.values()),
                            "main", argparse.Namespace(no_fetch=False),
@@ -460,6 +466,19 @@ class ImportTests(World):
                          [(n, n - i, i) for i in range(1, n + 1)])
         self.assertEqual(seen[-1], (n, 0, n))
         self.assertFalse(any(c.asking for c in commits))
+
+    def test_triage_cache_is_shared(self):
+        """Two runs (say, two users) adding answers keep each other's."""
+        repo = Repo(self.ours)
+        one, two = triage.Cache(repo), triage.Cache(repo)
+        one.data["a" * 40] = {"kind": "bugfix"}
+        one.save()
+        two.data["b" * 40] = {"kind": "perf"}
+        two.save()
+        self.assertEqual(set(triage.Cache(repo).data), {"a" * 40, "b" * 40})
+        self.assertEqual(os.listdir(repo.state_dir()).count("triage.json"), 1)
+        self.assertFalse([f for f in os.listdir(repo.state_dir())
+                          if f.endswith(".tmp")])
 
     def test_agent_ports_and_fixes(self):
         self.use_fake_agent()
@@ -489,13 +508,18 @@ class ImportTests(World):
         self.assertIn("=> passed after the repair (adapted)",
                       tried[self.p5][0])
         self.assertNotIn("also changed", out)
+        # one triage question per commit (it was unsure of 4), then the
+        # port and the repair
         with open(os.environ["FAKE_AGENT_LOG"]) as handle:
             self.assertEqual(handle.read().split(),
-                             ["triage", "port", "fix"])
+                             ["triage"] * 4 + ["port", "fix"])
+        cache = os.path.join(self.ours, ".git", "diaspora", "triage.json")
+        with open(cache) as handle:
+            self.assertEqual(len(json.load(handle)), 4)
         # the agent's triage is cached: a second scan does not ask again
         self.run_cli("list", code=0)
         with open(os.environ["FAKE_AGENT_LOG"]) as handle:
-            self.assertEqual(handle.read().split().count("triage"), 1)
+            self.assertEqual(handle.read().split().count("triage"), 4)
 
     def test_repair_outside_the_import_is_reported(self):
         self.use_fake_agent()

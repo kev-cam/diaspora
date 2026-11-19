@@ -300,7 +300,7 @@ directory, job counts, which agent.
 |-----|---------|---------|
 | `command` | the agent; `none` for no agent | `[agent] command` in `~/.config/diaspora`, else `claude` (on `PATH`, or in `~/.local/bin`) |
 | `triage` | `auto`: ask about commits the message pass is unsure of; `all`; `off` | `auto` |
-| `triage-batch`, `triage-max`, `triage-jobs` | commits per question, commits per run, questions asked at once | 20, 100, 4 |
+| `triage-batch`, `triage-max`, `triage-jobs` | commits per question (each answer is cached in `.git/diaspora/triage.json` as it comes, and that commit is never asked about again), commits per run, questions asked at once | 1, 100, 4 |
 | `port` | let the agent port conflicts and repair test failures | `true` |
 | `fix-attempts` | repair attempts after a failed test | 1 |
 | `model`, `triage-model` | models for porting and for triage | the agent's own default |
