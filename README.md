@@ -141,7 +141,8 @@ Xyce, Icarus Verilog and VACASK. In all of them the full regression is the
 gate for every kind of change, and since their suites have failures of
 their own, it is a [no-new-failures](#a-suite-that-already-has-failures)
 gate, fed by a regression harness for the first three and by `ctest` for
-VACASK. Between them they show a separate build tree and an in-tree build,
+VACASK, which must also pass a second level, `mixed-signal`: vamos's tests
+and the VACASK/nvc co-simulation demos, through the same harness. Between them they show a separate build tree and an in-tree build,
 autotools and CMake, and a fork that shares no git history with its peer
 (`since`).
 
