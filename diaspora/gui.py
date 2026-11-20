@@ -18,6 +18,7 @@ import collections
 import http.server
 import json
 import os
+import re
 import secrets
 import subprocess
 import threading
@@ -297,12 +298,21 @@ class App:
                           interactive=False)
         if session.exists():
             data = session.load().data
+            choices = data.get("choices") or {}
+            items = []
+            for i in data["items"]:
+                item = {k: i.get(k) for k in (
+                    "peer", "sha", "subject", "state", "note", "mode")}
+                if i["state"] == "failed":
+                    item["choice"] = choices.get(i["sha"], "failed")
+                    item["can_include"] = bool(
+                        data["stage"] == "ready" and session.attempt(i))
+                    item["log"] = bool(self._test_log(i))
+                items.append(item)
             run = {"id": data["id"], "dir": data["dir"],
                    "stage": data["stage"], "branch": data["branch"],
                    "target": data["target"], "workspace": session.ws.path,
-                   "items": [{k: i.get(k) for k in (
-                       "peer", "sha", "subject", "state", "note", "mode")}
-                       for i in data["items"]]}
+                   "items": items}
         count, lines = self.ui.since(since)
         return {
             "repo": self.repo.top, "target": target,
@@ -321,6 +331,40 @@ class App:
             "agent_cost": round(self.agent_cost, 2),
             "repos": self.repos(),
         }
+
+    def _test_log(self, item):
+        """The test log a failed item's note names, if it is one of ours."""
+        match = re.search(r"\(log: ([^)\s]+)", item.get("note") or "")
+        if not match:
+            return None
+        where = os.path.realpath(match.group(1))
+        logs = os.path.realpath(self.repo.state_dir("logs"))
+        if not where.startswith(logs + os.sep) or not os.path.isfile(where):
+            return None
+        return where
+
+    def run_log(self, sha):
+        session = self.session()
+        if not session.exists():
+            raise DiasporaError("no run")
+        item = next((i for i in session.load().data["items"]
+                     if i["sha"] == sha), None)
+        where = item and self._test_log(item)
+        if not where:
+            raise DiasporaError("no test log for %s" % sha[:10])
+        with open(where, encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+        if len(text) > 400000:
+            text = "... (the start cut)\n" + text[-400000:]
+        return {"text": text, "path": where}
+
+    def choose(self, sha, choice):
+        if self.busy():
+            raise DiasporaError("busy: %s is still running" % self.job["name"])
+        session = self.session()
+        if not session.exists():
+            raise DiasporaError("no run")
+        session.load().choose(sha, choice)
 
     def show(self, sha, diff=False):
         commit = next((c for c in self.commits if c.sha == sha), None)
@@ -398,6 +442,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if url.path == "/api/state":
                 since = int((query.get("since") or ["0"])[0])
                 return self._json(200, self.app.state(since))
+            if url.path == "/api/runlog":
+                return self._json(200, self.app.run_log(
+                    (query.get("commit") or [""])[0]))
             if url.path == "/api/show":
                 return self._json(200, self.app.show(
                     (query.get("commit") or [""])[0],
@@ -435,6 +482,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     raise DiasporaError(
                         "a run is waiting: accept (promote) or drop it first")
                 app.start("import", app.do_apply)
+            elif url.path == "/api/choose":
+                app.choose(body.get("commit", ""), body.get("choice", ""))
             elif url.path == "/api/run":
                 action = body.get("action")
                 app.start(action, app.do_run, action,
@@ -529,7 +578,10 @@ button.danger { color: var(--bad); }
 section.run { background: var(--panel); border: 1px solid var(--line);
   border-radius: 8px; padding: 12px 14px; margin-bottom: 16px; }
 section.run h2 { font-size: 15px; margin: 0 0 8px; }
-.run .items div { font-family: var(--mono); font-size: 12.5px; }
+.run .items div.item { font-family: var(--mono); font-size: 12.5px; }
+.run .choice { font-family: system-ui, sans-serif; margin: 3px 0 6px 11ch; color: var(--dim); }
+.run .choice select { font: inherit; color: var(--ink); background: var(--panel);
+  border: 1px solid var(--line); border-radius: 6px; padding: 1px 4px; }
 .run .actions { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap;
   align-items: center; }
 table { width: 100%; border-collapse: collapse; background: var(--panel);
@@ -656,6 +708,7 @@ async function act(path, body) {
 
 function label(c) {
   const b = (cls, text) => `<span class="badge ${cls}" tabindex="0" data-tip="badge" data-sha="${c.commit}">${text}</span>`;
+  if (S.run && S.run.items.some(i => i.sha === c.commit)) return b("asking", "in the run above");
   if (c.asking) return b("asking", "agent reading …");
   if (c.status === "failed") return b("failed", "failed before");
   if (c.tried.length) return b("failed", "tried before");
@@ -676,6 +729,10 @@ function badgeHelp(c) {
     <b>${esc(c.kind)}</b>; from ${esc(c.peer)} it imports <b>${esc(kinds)}</b>
     by default (<code>import =</code> in diaspora.conf).</p>`;
   const pick = `<p>Labels only advise: nothing is marked until you press a button.</p>`;
+  if (S.run && S.run.items.some(i => i.sha === c.commit)) return `<p><b>In the
+    run above.</b> It is being imported (or was tried) in the run that is
+    waiting; what becomes of it is decided there, when the run is promoted
+    or dropped.</p>`;
   if (c.asking) return `<p><b>The agent is reading it.</b> Its message
     did not make clear enough what it is, so diaspora asked the agent. Until the
     answer is in, it is sorted by its message alone: <b>${esc(c.kind)}</b>.</p>
@@ -744,6 +801,29 @@ function help(what, el) {
       diaspora.ledger, committed on ${tgt}.</p>
       <p>No code changes. It drops out of the list but is still a candidate:
       tick “show ignored and deferred” to see it, and Accept it whenever you like.</p>`,
+    promote: (() => {
+      const R = S.run; if (!R) return "";
+      const done = R.items.filter(i => i.state === "done");
+      const failed = R.items.filter(i => i.state === "failed");
+      const what = {failed: "left out, recorded as <i>failed</i>: it shows again as “failed before”, to Retry",
+        reject: "left out, recorded as <i>rejected</i>: not offered again",
+        defer: "left out, recorded as <i>deferred</i>",
+        include: "<b>included</b> although its tests failed (the ledger says so)"};
+      return `<p>Fast-forwards ${tgt} to the run's branch: the ${done.length} that passed
+        ${done.length === 1 ? "goes" : "go"} in, each as tested.</p>` +
+        (failed.length ? `<p>${failed.map(i => `<code>${esc(i.sha.slice(0, 10))}</code> is ${what[i.choice] || what.failed}`).join("<br>")}.</p>` : "") +
+        `<p>What was tried and failed goes into diaspora.log, the verdicts into
+        diaspora.ledger, in one more commit. Nothing is pushed.</p>`;
+    })(),
+    abort: `<p>Throws the run away: ${tgt} is not touched and the ledger is not
+      changed, so every commit in it is offered again as before.</p>
+      <p>With the box ticked, what failed is still noted in diaspora.log (a
+      commit on ${tgt}), so the agent knows next time.</p>`,
+    choice: `<p>What becomes of this commit when you promote the run.
+      <b>Include it anyway</b> takes the attempt that failed its tests (the
+      agent's port and repair, if any) onto the branch after the ones that
+      passed, untested together with them; use it when the failure is not
+      the commit's fault, e.g. a test that needs something this machine lacks.</p>`,
     apply: `<p>Carries out the marks: <i>reject</i> and <i>defer</i> are recorded
       in diaspora.ledger on ${tgt}; <i>accept</i> and <i>retry</i> start one
       import run (test branch, <b>${esc(gate())}</b>).</p>
@@ -752,7 +832,8 @@ function help(what, el) {
   }[what];
   const wait = what === "apply" && S.run ?
     `<p><b>Finish the run above first</b> (promote it or drop it).</p>` : "";
-  return tip ? wait + tip + (what === "apply" ? "" : later) : "";
+  const own = what === "apply" || what === "promote" || what === "abort" || what === "choice";
+  return tip ? wait + tip + (own ? "" : later) : "";
 }
 let tipFor = null, tipTimer = 0;
 function showTip(el) {
@@ -808,8 +889,9 @@ function renderRows() {
   setHTML($("rows"), list.map(c => {
     const again = c.status === "failed" || c.tried.length;
     const opts = again ? ["retry", "reject", "defer"] : ["accept", "reject", "defer"];
+    const held = S.run && S.run.items.some(i => i.sha === c.commit);
     const btns = opts.map(m => `<button class="${m}${c.mark === m ? " on" : ""}"
-      data-sha="${c.commit}" data-mark="${m}" data-tip="${m}" ${busy ? "disabled" : ""}>${
+      data-sha="${c.commit}" data-mark="${m}" data-tip="${m}" ${busy || held ? "disabled" : ""}>${
       m[0].toUpperCase() + m.slice(1)}</button>`).join(" ");
     const agent = c.triage === "agent" ? `agent${c.risk ? ", risk " + esc(c.risk) : ""}: ${
       esc(c.reason || c.summary)}` : (c.why && c.status === "pending" &&
@@ -842,13 +924,19 @@ function renderRun() {
   const paused = R.items.some(i => i.state === "paused");
   const done = R.items.filter(i => i.state === "done").length;
   const dis = S.busy ? "disabled" : "";
+  const failed = R.items.filter(i => i.state === "failed");
+  const inc = failed.filter(i => i.choice === "include").length;
   let stage = R.stage === "ready" ? `tested: ${done} of ${R.items.length} passed` :
     paused ? "waiting: a conflict needs a person" :
     S.busy ? "running" : "stopped (blocked or interrupted)";
   let acts = "";
-  if (R.stage === "ready") acts =
-    `<button class="primary" data-run="promote" ${dis} ${done ? "" : "disabled"}>Accept: promote to ${esc(R.target)}</button>
-     <button class="danger" data-run="abort" ${dis}>Drop the run</button>`;
+  if (R.stage === "ready") {
+    const n = done + inc;
+    acts = `<button class="primary" data-run="promote" data-tip="promote" ${dis} ${n || failed.length ? "" : "disabled"}>${
+      n ? `Promote ${n} to ${esc(R.target)}` + (inc ? ` (${inc} despite failed tests)` : "")
+        : `Record the outcome on ${esc(R.target)}`}</button>
+     <button class="danger" data-run="abort" data-tip="abort" ${dis}>Drop the run: nothing goes to ${esc(R.target)}</button>`;
+  }
   else if (paused) acts =
     `<span class="dim">Resolve it in <code>${esc(R.workspace)}</code> and <code>git add</code>, then</span>
      <button data-run="continue" ${dis}>Continue</button>
@@ -859,10 +947,24 @@ function renderRun() {
      <button class="danger" data-run="abort">Drop the run</button>`;
   if (acts.includes('data-run="abort"')) acts +=
     ` <label class="dim"><input type="checkbox" id="keeplog" checked> keep what did not work in diaspora.log</label>`;
+  const word = {done: "passed", failed: "failed", picked: "testing", queued: "queued",
+    paused: "waiting", superseded: "not needed", "not-applicable": "not needed"};
+  const choice = i => {
+    if (R.stage !== "ready" || i.state !== "failed") return "";
+    const opt = (v, t, off) => `<option value="${v}" ${i.choice === v ? "selected" : ""} ${off ? "disabled" : ""}>${t}</option>`;
+    return `<div class="choice">on promote:
+      <select data-choose="${i.sha}" data-tip="choice" ${dis}>
+        ${opt("failed", "leave it out, offer it again later (Retry)")}
+        ${opt("reject", "leave it out and reject it")}
+        ${opt("defer", "leave it out and defer it")}
+        ${opt("include", "include it anyway" + (i.can_include ? "" : " (nothing to include: it never got as far as a commit)"), !i.can_include)}
+      </select>
+      ${i.log ? `<button data-runlog="${i.sha}">Test log</button>` : ""}</div>`;
+  };
   setHTML(el, `<h2>Run ${esc(R.id)} <span class="dim">· ${stage} · branch ${esc(R.branch)}</span></h2>
-    <div class="items">${R.items.map(i => `<div><span class="st-${esc(i.state)}">${
-      esc(i.state.padEnd(9))}</span> ${esc(i.sha.slice(0, 10))} ${esc(i.subject)}${
-      i.note ? ` <span class="dim">— ${esc(i.note)}</span>` : ""}</div>`).join("")}</div>
+    <div class="items">${R.items.map(i => `<div class="item"><span class="st-${esc(i.state)}">${
+      esc((word[i.state] || i.state).padEnd(10))}</span> ${esc(i.sha.slice(0, 10))} ${esc(i.subject)}${
+      i.note ? ` <span class="dim">— ${esc(i.note.replace(/ \(log: [^)]*\)/, ""))}</span>` : ""}${choice(i)}</div>`).join("")}</div>
     <div class="actions">${acts}</div>`);
 }
 
@@ -955,6 +1057,7 @@ async function showCommit(sha, diff) {
   shown = sha;
   const c = S.commits.find(x => x.commit === sha);
   $("dlgt").textContent = `${c.short} ${c.subject}`;
+  $("dlgdiff").hidden = false;
   $("dlgdiff").textContent = diff ? "Files" : "Diff";
   $("dlgdiff").dataset.diff = diff ? "0" : "1";
   $("dlgtext").textContent = "…";
@@ -985,6 +1088,7 @@ document.addEventListener("click", ev => {
     }
     return act("/api/mark", {commits: [c.commit], mark, why});
   }
+  if (b.dataset.runlog) return showRunLog(b.dataset.runlog);
   if (b.dataset.run) {
     const a = b.dataset.run;
     if (a === "abort" && !confirm("Drop the whole run? Imports that passed are thrown away.")) return;
@@ -992,6 +1096,21 @@ document.addEventListener("click", ev => {
     return act("/api/run", {action: a, keep_log: keep});
   }
 });
+document.addEventListener("change", ev => {
+  const s = ev.target;
+  if (s.dataset && s.dataset.choose)
+    act("/api/choose", {commit: s.dataset.choose, choice: s.value});
+});
+async function showRunLog(sha) {
+  const i = S.run.items.find(x => x.sha === sha);
+  shown = null;
+  $("dlgt").textContent = `test log: ${sha.slice(0, 10)} ${i ? i.subject : ""}`;
+  $("dlgdiff").hidden = true;
+  $("dlgtext").textContent = "loading …";
+  $("dlg").showModal();
+  try { $("dlgtext").textContent = (await api("/api/runlog?commit=" + sha)).text; }
+  catch (e) { $("dlgtext").textContent = e.message; }
+}
 $("fetch").onclick = () => act("/api/scan", {fetch: true});
 $("rescan").onclick = () => act("/api/scan", {fetch: false});
 $("apply").onclick = () => act("/api/apply", {});

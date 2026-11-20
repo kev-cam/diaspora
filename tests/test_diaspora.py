@@ -554,6 +554,54 @@ class ImportTests(World):
         self.assertEqual(self.ledger()[self.p4]["verdict"], "superseded")
         self.assertIn("line2 ours", self.read("src/b.c"))
 
+    def test_promote_with_a_failed_commit(self):
+        """A commit that failed its tests is left out as failed unless told
+        otherwise: included anyway, rejected or deferred."""
+        def run():
+            self.run_cli("import", "--pick", self.p1, "--pick", self.p5,
+                         code=4)                 # 4: some failed
+            with open(os.path.join(self.ours, ".git", "diaspora",
+                                   "session.json")) as handle:
+                data = json.load(handle)
+            states = {i["sha"]: i["state"] for i in data["items"]}
+            self.assertEqual(states, {self.p1: "done", self.p5: "failed"})
+            return data["id"]
+
+        run_id = run()
+        refs = git(self.ours, "for-each-ref", "--format=%(refname)",
+                   "refs/diaspora/attempts/")
+        self.assertEqual(refs, "refs/diaspora/attempts/%s/%s"
+                         % (run_id, self.p5))
+        self.run_cli("promote", "--include", self.p5[:10], code=0)
+        self.assertEqual(self.read("src/c.c"), "BREAK")      # it went in
+        self.assertIn("return 2", self.read("src/a.c"))
+        entry = self.ledger()[self.p5]
+        self.assertEqual(entry["verdict"], "applied")
+        self.assertIn("included although test regress failed", entry["note"])
+        self.assertIn("=> failed; included anyway (applied)",
+                      self.tried()[self.p5][0])
+        self.assertEqual(git(self.ours, "for-each-ref",
+                             "refs/diaspora/attempts/"), "")
+        self.assertIn("Diaspora-Origin: up@%s" % self.p5,
+                      git(self.ours, "log", "--format=%B", "-3", "main"))
+
+    def test_promote_rejecting_a_failed_commit(self):
+        self.run_cli("import", "--pick", self.p1, "--pick", self.p5,
+                     "--pick", self.p4, code=4)
+        # p4 failed on a conflict: there is nothing to include
+        self.run_cli("promote", "--include", self.p4, code=1)
+        self.assertIn("cannot be included", self.last_err)
+        self.run_cli("promote", "--reject", self.p5, "--defer", self.p4,
+                     code=0)
+        ledger = self.ledger()
+        self.assertEqual(ledger[self.p1]["verdict"], "applied")
+        self.assertEqual(ledger[self.p5]["verdict"], "rejected")
+        self.assertIn("left out after test regress failed",
+                      ledger[self.p5]["note"])
+        self.assertEqual(ledger[self.p4]["verdict"], "deferred")
+        self.assertEqual(git(self.ours, "ls-tree", "main", "src/c.c"), "")
+        self.assertIn("=> failed; then rejected", self.tried()[self.p5][0])
+
     def test_pick_a_reviewed_commit(self):
         self.run_cli("import", "--pick", self.p3, "--yes", code=0)
         self.assertEqual(self.read("src/x.c"), "x")

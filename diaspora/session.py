@@ -22,6 +22,9 @@ from . import tried as T
 from .gitutil import DiasporaError, GitError, run
 from .workspace import Tester, Workspace, tail
 
+# what may become of a failed commit when its run is promoted (choose())
+CHOICES = ("failed", "reject", "defer", "include")
+
 PORT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -271,10 +274,124 @@ class Session:
                     os.remove(full)
 
     def _fail(self, item, note, tried=True):
+        if item.get("our") and self.ws.head() == item["our"] != item["head0"]:
+            self._keep_attempt(item, item["our"])
         self._reset(item["head0"])
         item["state"], item["note"] = "failed", note
         if tried:
             self._tried(item, note)
+
+    # -- failed attempts, and what to do with them ------------------------------------
+    def _attempt_ref(self, item):
+        return "refs/diaspora/attempts/%s/%s" % (self.data["id"], item["sha"])
+
+    def _keep_attempt(self, item, sha):
+        """Keep a failed attempt's commit (it may be included after all)."""
+        item["attempt"] = sha
+        self.repo.proc("update-ref", self._attempt_ref(item), sha,
+                       check=False)
+
+    def attempt(self, item):
+        """The commit of a failed attempt that got as far as a commit (it
+        failed its tests), or None (it failed before: conflicts, ...)."""
+        if item["state"] != "failed":
+            return None
+        sha = item.get("attempt")
+        if not sha and item.get("our") and item["our"] != item["head0"] \
+                and item["note"].startswith("test "):
+            sha = item["our"]       # (a run from before attempts were kept)
+        if sha and self.repo.ok("cat-file", "-e", sha + "^{commit}"):
+            if not item.get("attempt"):
+                self._keep_attempt(item, sha)
+                self.save()
+            return sha
+        return None
+
+    def choose(self, sha, choice):
+        """What to do with a failed commit when the run is promoted:
+        failed (leave it out, recorded as failed: offered again), reject,
+        defer (leave it out with that verdict), include (its attempt goes
+        in although its tests failed)."""
+        item = next((i for i in self.data["items"]
+                     if i["sha"].startswith(sha)), None) if sha else None
+        if item is None:
+            raise DiasporaError("%s is not in this run" % sha)
+        if item["state"] != "failed":
+            raise DiasporaError("%s did not fail; only failed commits take "
+                                "a choice" % item["sha"][:10])
+        if choice not in CHOICES:
+            raise DiasporaError("choice must be one of %s" % ", ".join(
+                CHOICES))
+        if choice == "include" and not self.attempt(item):
+            raise DiasporaError(
+                "%s cannot be included: it failed before there was anything "
+                "to include (%s)" % (item["sha"][:10], item["note"]))
+        if self.data["stage"] != "ready":
+            raise DiasporaError("the run is not finished")
+        self.data.setdefault("choices", {})[item["sha"]] = choice
+        self.save()
+
+    def _apply_choices(self):
+        """Carry out choose(): rebuild the branch's ledger commit with the
+        chosen verdicts, and the included attempts before it."""
+        data, ws = self.data, self.ws
+        choices = {sha: c for sha, c in (data.get("choices") or {}).items()
+                   if c != "failed"}
+        items = [i for i in data["items"]
+                 if i["state"] == "failed" and i["sha"] in choices]
+        if not items:
+            return
+        if ws.inplace and data["restore"] is None:
+            if ws.dirty():
+                raise DiasporaError("including a failed commit needs a "
+                                    "clean checkout (workspace = inplace)")
+            data["restore"] = self.repo.current_branch() or ws.head()
+            self.save()
+        ws.git("checkout", "--quiet", "--force", data["branch"])
+        tip = ws.head()
+        if data["ledger_commit"]:
+            ws.git("reset", "--quiet", "--hard", "HEAD~1")
+        for item in items:
+            choice = choices[item["sha"]]
+            if choice != "include":
+                continue
+            proc = ws.proc("cherry-pick", "--allow-empty",
+                           self.attempt(item), check=False)
+            if proc.returncode:
+                ws.proc("cherry-pick", "--abort", check=False)
+                ws.git("reset", "--quiet", "--hard", tip)
+                raise DiasporaError(
+                    "%s cannot be included: its attempt does not apply on "
+                    "top of the imports that passed (%s); nothing changed"
+                    % (item["sha"][:10], (proc.stderr or proc.stdout)
+                       .strip().splitlines()[-1:] or "conflict"))
+        for item in items:
+            choice = choices[item["sha"]]
+            failure = item["note"]
+            item["choice"] = choice
+            if choice == "include":
+                item["state"], item["our"] = "done", ws.head()
+                item["note"] = "included although %s" % failure
+                item.setdefault("mode", L.ADAPTED)
+            else:
+                item["state"] = L.REJECTED if choice == "reject" \
+                    else L.DEFERRED
+                item["note"] = "left out after %s" % failure
+        # the included ones were replayed in run order at the end: fine,
+        # each was a commit of its own on the same base
+        data["entries"] = self._entries()
+        data["log"] = self._log_text()
+        data["ledger_commit"] = self._commit_ledger(data["entries"],
+                                                    data["log"])
+        data["choices"] = {}
+        self.save()
+
+    def _drop_attempts(self):
+        refs = self.repo.git(
+            "for-each-ref", "--format=%(refname)",
+            "refs/diaspora/attempts/%s/" % self.data["id"]).splitlines()
+        for ref in refs:
+            self.repo.proc("update-ref", "-d", ref, check=False)
 
     # -- what did not work (diaspora.log) ------------------------------------------
     def _tried(self, item, line):
@@ -300,6 +417,11 @@ class Session:
         for item in self.data["items"] if items is None else items:
             if item["state"] == "failed":
                 outcome = "failed"
+            elif item.get("choice") == "include":
+                outcome = "failed; included anyway (%s)" % item.get(
+                    "mode", L.ADAPTED)
+            elif item.get("choice") in ("reject", "defer"):
+                outcome = "failed; then %s" % item["state"]
             elif item["state"] == "done" and item.get("setback"):
                 outcome = "passed after the repair (%s)" % item.get(
                     "mode", L.ADAPTED)
@@ -657,7 +779,8 @@ class Session:
                                    item["subject"], item["kind"],
                                    note=note or None,
                                    tests=item.get("tests")))
-            elif state in ("failed", L.SUPERSEDED, L.NOT_APPLICABLE):
+            elif state in ("failed", L.SUPERSEDED, L.NOT_APPLICABLE,
+                           L.REJECTED, L.DEFERRED):
                 out.append(L.entry(item["peer"], item["sha"], state,
                                    item["subject"], item["kind"],
                                    note=item["note"] or None))
@@ -782,6 +905,7 @@ class Session:
             raise DiasporaError("the run is not finished (stage: %s); "
                                 "`diaspora continue` first" % data["stage"])
         branch, target = data["branch"], data["target"]
+        self._apply_choices()
         if not repo.is_ancestor(target, branch):
             self._rebase()
         ws.end(data["restore"])
@@ -851,6 +975,7 @@ class Session:
                     data["target"], level, log, data["branch"]))
 
     def _cleanup(self):
+        self._drop_attempts()
         if self.data.get("restore") is not None or not self.ws.inplace:
             self.ws.end(self.data.get("restore"))
         self.repo.proc("branch", "-D", self.data["branch"], check=False)
@@ -939,6 +1064,7 @@ class Session:
             self.ws.proc("reset", "--quiet", "--hard", check=False)
             self.ws.end(data.get("restore"))
         self.repo.proc("branch", "-D", data["branch"], check=False)
+        self._drop_attempts()
         self._archive()
         if not log:
             self.ui.say("Run %s dropped; nothing was recorded." % data["id"])

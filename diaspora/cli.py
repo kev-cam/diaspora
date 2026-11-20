@@ -376,7 +376,11 @@ def cmd_abort(repo, ui, args):
 
 
 def cmd_promote(repo, ui, args):
-    _session(repo, ui, args).promote()
+    session = _session(repo, ui, args)
+    for choice in ("include", "reject", "defer"):
+        for sha in getattr(args, choice) or []:
+            session.choose(sha, choice)
+    session.promote()
     return 0
 
 
@@ -781,6 +785,16 @@ def build_parser():
                        help="do not ask before promoting")
         p.add_argument("--no-agent", action="store_true")
         p.add_argument("-v", "--verbose", action="store_true")
+        if name == "promote":
+            p.add_argument("--include", action="append", metavar="COMMIT",
+                           help="a commit that failed its tests goes in "
+                           "anyway (repeatable)")
+            p.add_argument("--reject", action="append", metavar="COMMIT",
+                           help="a failed commit is left out as rejected, "
+                           "not as failed (repeatable)")
+            p.add_argument("--defer", action="append", metavar="COMMIT",
+                           help="a failed commit is left out as deferred "
+                           "(repeatable)")
         if name == "abort":
             p.add_argument("--no-log", action="store_true",
                            help="do not record in diaspora.log what was "
