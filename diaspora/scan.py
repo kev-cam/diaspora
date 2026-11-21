@@ -43,6 +43,11 @@ class Commit:
     disposition: str = "review"      # import | review | ignore
     why: str = ""
     asking: bool = False             # the agent is reading it right now
+    # files of it that our own commits changed since we parted from the
+    # peer (None: no history in common, so not known), and by which
+    ours: list = None
+    ours_by: dict = field(default_factory=dict)
+    ours_lists: list = field(default_factory=list)   # ... of them, lists
 
     @property
     def paths(self):
@@ -72,7 +77,10 @@ class Commit:
             "disposition": self.disposition, "why": self.why,
             "absent": self.absent, "asking": self.asking,
             "added": self.added, "deleted": self.deleted,
-            "files": self.paths,
+            "files": self.paths, "ours": self.ours,
+            "ours_lists": self.ours_lists,
+            "ours_by": {path: [[sha[:10], subject] for sha, subject in by]
+                        for path, by in self.ours_by.items()},
         }
 
 
@@ -162,6 +170,68 @@ def _taken(sha, found):
                                if len(f) < 40)
 
 
+def our_changes(repo, conf, peer, target):
+    """Files our own commits on `target` changed since it parted from the peer.
+
+    Our own: on `target` and not on the peer, not imported from it (by a
+    Diaspora-Origin trailer or a `cherry picked from` line) and not the same
+    patch as one of its commits (ours that it took).  Returns {path:
+    [(sha, subject), ...]}, oldest first, without diaspora's own files; or
+    None when there is no telling.
+
+    A repository that was copied, not cloned, has no history in common with
+    the peer; then the peer's `since` is taken as the commit it was copied
+    from, and a file is ours when one of our commits (not the first, the
+    copy itself) changed it and it differs both from the peer's file at
+    `since` and from the peer's file now.  Without `since`: None.
+    """
+    meta = {CONF_NAME, LOCAL_NAME, conf.ledger, conf.log}
+    shared = not repo.proc("merge-base", target, peer.ref,
+                           check=False).returncode
+    if shared:
+        commits = log(repo, target, "^" + peer.ref)
+        skip = equivalents(repo, peer.ref, target) if commits else set()
+        differs = None
+    else:
+        base = repo.rev(peer.since) if peer.since else None
+        if not base:
+            return None
+        commits = log(repo, target)
+        skip = set(repo.git("rev-list", "--max-parents=0",
+                            target).split())
+
+        def changed(a, b):
+            return set(repo.git("-c", "core.quotepath=off", "diff",
+                                "--no-renames", "--name-only", a, b,
+                                "--").splitlines())
+        differs = changed(base, target) & changed(peer.ref, target)
+    out = {}
+    for commit in commits:
+        if commit.sha in skip or ORIGIN_RE.search(commit.body) \
+                or PICKED_RE.search(commit.body):
+            continue
+        for path in commit.paths:
+            if path not in meta and (differs is None or path in differs):
+                out.setdefault(path, []).append((commit.sha, commit.subject))
+    return out
+
+
+def mark_ours(commits, ours, lists=None):
+    """Note which files of each peer commit our own commits changed too.
+
+    Files in `lists` ([divergence] lists: a test list, NEWS) go in
+    `ours_lists` instead of `ours`: both sides adding to one is no overlap.
+    """
+    for commit in commits:
+        if ours is None:
+            commit.ours, commit.ours_by, commit.ours_lists = None, {}, []
+            continue
+        both = [p for p in commit.paths if p in ours]
+        commit.ours_lists = [p for p in both if lists and lists.match(p)]
+        commit.ours = [p for p in both if p not in commit.ours_lists]
+        commit.ours_by = {p: ours[p][-3:] for p in both}
+
+
 def since_args(repo, peer):
     if not peer.since:
         return []
@@ -213,6 +283,8 @@ def import_candidates(repo, conf, peer, target, ledger):
                 commit.note = verdict.get("note", "")
             keep.append(commit)
     mark_absent(keep, tree_paths(repo, target), meta)
+    if keep:
+        mark_ours(keep, our_changes(repo, conf, peer, target), conf.lists)
     return keep, dropped
 
 

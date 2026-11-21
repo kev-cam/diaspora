@@ -324,6 +324,52 @@ class ScanTests(World):
         self.assertEqual(found[self.p1].kind, "bugfix")
         self.assertEqual(found[self.p3].kind, "feature")
 
+    def test_files_we_changed(self):
+        found, _ = self.candidates()
+        # o1 changed b; o2 changed d but the peer has the same patch (p6)
+        self.assertEqual(found[self.p4].ours, ["src/b.c"])
+        self.assertEqual([s for s, _ in found[self.p4].ours_by["src/b.c"]],
+                         [self.o1])
+        self.assertEqual(found[self.p1].ours, [])
+        self.assertEqual(found[self.p4].as_dict()["ours_by"]["src/b.c"],
+                         [[self.o1[:10], "Rework b for our needs"]])
+
+    def test_files_we_changed_lists(self):
+        self.local_conf("[divergence]\n\tlists = src/b.c\n")
+        found, _ = self.candidates()
+        self.assertEqual(found[self.p4].ours, [])
+        self.assertEqual(found[self.p4].ours_lists, ["src/b.c"])
+        self.assertIn("src/b.c", found[self.p4].ours_by)
+
+    def test_files_we_changed_in_a_copy(self):
+        # copied, not cloned: no history in common; `since` is the copy
+        root = git(self.peer, "rev-list", "--max-parents=0", "main")
+        copy = os.path.join(self.tmp, "copy")
+        os.mkdir(copy)
+        git(copy, "init", "-q", "-b", "main")
+        subprocess.run("git -C %s archive %s | tar -x -C %s"
+                       % (self.peer, root, copy), shell=True, check=True)
+        git(copy, "add", "-A")
+        git(copy, "commit", "-q", "-m", "Clone of the peer")
+        self.commit(copy, "Rework b for our needs", {
+            "src/b.c": "line1\nline2 ours\nline3\nline4\nline5\n"})
+        self.commit(copy, "Fix crash in a when called twice\n\n"
+                    "Diaspora-Origin: up@%s (applied)" % self.p1, {
+                        "src/a.c": "int a(void)\n{\n    return 2;\n}\n"})
+        self.commit(copy, "Plug leak in d", {"src/d.c": "d1\nd2 fixed\nd3\n"})
+        self.commit(copy, "Add diaspora.conf", {
+            "diaspora.conf": CONF.format(peer=self.peer).replace(
+                "\tbranch = main\n", "\tbranch = main\n\tsince = %s\n" % root)})
+        self.ours = copy
+        found, _ = self.candidates()
+        self.assertEqual(found[self.p4].ours, ["src/b.c"])
+        # d is ours, but now the same as the peer's: no telling it apart
+        self.assertNotIn(self.p6, found)
+        self.assertEqual(found[self.p3].ours, [])
+        self.local_conf('[peer "up"]\n\tsince =\n')
+        found, _ = self.candidates()
+        self.assertIsNone(found[self.p4].ours)
+
     def test_since(self):
         self.local_conf('[peer "up"]\n\tsince = %s\n' % self.p3)
         found, _ = self.candidates()
@@ -1126,6 +1172,16 @@ class GuiTests(World):
         code, _ = self.call("/api/mark", {"commits": [], "mark": "accept"},
                             token="")
         self.assertEqual(code, 403)
+
+    def test_overlap_with_our_files(self):
+        code, state = self.call("/api/state")
+        self.assertEqual(code, 200, state)
+        rows = {c["commit"]: c for c in state["commits"]}
+        self.assertEqual(rows[self.p4]["ours"], ["src/b.c"])
+        self.assertEqual(rows[self.p1]["ours"], [])
+        page = self.call("/")[1]
+        self.assertIn("touches ours", page)
+        self.assertIn("no overlap", page)
 
     def test_what_is_tested(self):
         with open(os.path.join(self.ours, "diaspora.conf"), "a") as handle:

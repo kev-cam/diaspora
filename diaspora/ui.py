@@ -121,6 +121,10 @@ class UI:
                     and commit.status == "pending" \
                     and not commit.why.endswith("by default"):
                 notes.append(commit.why)
+            if commit.ours:
+                notes.append("touches %d file%s we changed: %s" % (
+                    len(commit.ours), "" if len(commit.ours) == 1 else "s",
+                    ", ".join(commit.ours)))
             for note in notes:
                 print(self.paint(" " * 8 + note[:self.width - 9], "2"))
 

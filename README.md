@@ -268,11 +268,25 @@ costs up to two extra runs of the suite; a passing one costs none.
 [divergence]
 	rewritten = src/jit/**
 	removed = contrib/**
+	lists = test/regress/testlist.txt NEWS.md
 ```
 
 Commits touching only `removed` paths are not applicable and never listed.
 A commit touching `rewritten` paths is handed to the agent even when the
 diff applies: a diff that applies to rewritten code is often wrong.
+
+Each candidate is checked against the files our own commits have changed
+since this repository parted from the peer (on the target, not imports
+from the peer, not patches it has too). The page labels it **touches
+ours: N** or **no overlap**, and its tip names the files and which of our
+commits changed them; on the terminal it is a note under the commit. A
+repository that was copied rather than cloned shares no history with the
+peer: then the peer's `since` is taken as the commit it was copied from,
+and a file counts as ours when one of our commits (after the copy) changed
+it and it differs from the peer's both then and now. With neither, there
+is no label. `lists` names files that nearly every commit adds a line to
+(test lists, NEWS): both sides changing one is not counted as an overlap,
+though the tip still mentions it.
 
 ### `[export]`
 

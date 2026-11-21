@@ -381,6 +381,9 @@ class Config:
 
         self.rewritten = PathSet(words("divergence", "", "rewritten"))
         self.removed = PathSet(words("divergence", "", "removed"))
+        # files every commit adds a line to (test lists, NEWS): both sides
+        # changing one is not an overlap worth a warning
+        self.lists = PathSet(words("divergence", "", "lists"))
         # paths that never leave this repository (read by peers, too)
         self.export_exclude = PathSet(words("export", "", "exclude"))
         self.export_paths = PathSet(words("export", "", "paths"))

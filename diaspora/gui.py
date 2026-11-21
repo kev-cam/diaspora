@@ -722,6 +722,9 @@ td.acts button.on.defer { background: var(--defer); color: var(--on-ink); border
 .badge.suggested { color: var(--ok); border-color: var(--ok); }
 .badge.asking { color: var(--accent); border-color: var(--accent); border-style: dashed; }
 .badge.deferred { color: var(--defer); border-color: var(--defer); }
+.badge.overlap { color: var(--warn); border-color: var(--warn); }
+#tip ul { margin: 0 0 5px; padding-left: 18px; } #tip code { font-size: 11.5px; }
+#tip .by { opacity: .8; font-size: 12px; }
 .dim { color: var(--dim); }
 .st-done { color: var(--ok); } .st-failed { color: var(--bad); }
 .st-paused { color: var(--warn); }
@@ -831,6 +834,35 @@ function label(c) {
   if (c.disposition === "ignore") return b("", "ignored");
   return b("", "review");
 }
+// does it touch files our own commits changed since we parted from the peer?
+function overlap(c) {
+  if (c.ours == null) return "";
+  const n = c.ours.length;
+  return `<span class="badge${n ? " overlap" : ""}" tabindex="0" data-tip="overlap"
+    data-sha="${c.commit}">${n ? `touches ours: ${n}` : "no overlap"}</span>`;
+}
+function overlapHelp(c) {
+  const files = c.files.length, n = c.ours.length;
+  const since = `since this repository parted from <b>${esc(c.peer)}</b>`;
+  const lists = (c.ours_lists || []).length ? `<p>It also adds to ${
+    c.ours_lists.map(p => `<code>${esc(p)}</code>`).join(", ")}, which we add
+    to too; a list like that (<code>lists =</code> in diaspora.conf) is not
+    counted: entries from both sides usually just go together.</p>` : "";
+  if (!n) return `<p><b>No overlap.</b> None of the ${files} file${
+    files === 1 ? "" : "s"} it changes has been changed by our own commits ${
+    since}${lists ? " (but for a list)" : ""}: it should go in as ${
+    esc(c.peer)} wrote it.</p>${lists}`;
+  const shown = c.ours.slice(0, 8).map(p => `<li><code>${esc(p)}</code>${
+    (c.ours_by[p] || []).map(([sha, subj]) =>
+      `<br><span class="by">${esc(sha.slice(0, 8))} ${esc(subj)}</span>`).join("")}</li>`);
+  if (n > 8) shown.push(`<li>and ${n - 8} more</li>`);
+  return `<p><b>Touches files we changed.</b> ${n} of the ${files} file${
+    files === 1 ? "" : "s"} it changes ${n === 1 ? "has" : "have"} also been
+    changed by our own commits ${since} (imports from it not counted):</p>
+    <ul>${shown.join("")}</ul>${lists}
+    <p>It may not apply as written (the agent then ports it), and it is worth
+    checking it fits with what we did there.</p>`;
+}
 // why a commit got its label (triage.decide), for the tip over it
 function badgeHelp(c) {
   const P = S.peers.find(p => p.name === c.peer) || {imports: [], ignore: []};
@@ -890,9 +922,9 @@ function gate() {
   return S.tests && S.tests.length ? S.tests.join(" then ") : "the test level";
 }
 function help(what, el) {
-  if (what === "badge") {
+  if (what === "badge" || what === "overlap") {
     const c = S.commits.find(x => x.commit === (el && el.dataset.sha));
-    return c ? badgeHelp(c) : "";
+    return !c ? "" : what === "badge" ? badgeHelp(c) : overlapHelp(c);
   }
   const tgt = `<b>${esc(S.target || "the target branch")}</b>`;
   const later = `<p>Nothing happens until you press <b>Apply</b>; press again to unmark.</p>`;
@@ -1019,7 +1051,7 @@ function renderRows() {
       <td class="hide-sm dim">${esc(c.date)}</td>
       <td>${esc(c.kind)}</td>
       <td class="hide-sm dim">+${c.added} −${c.deleted}</td>
-      <td class="subj">${esc(c.subject)} ${label(c)}
+      <td class="subj">${esc(c.subject)} ${label(c)}${overlap(c)}
         ${agent ? `<div class="note">${agent}</div>` : ""}
         ${t ? `<div class="tried">${esc(t)}</div>` : ""}
         ${c.why_mark ? `<div class="note">why: ${esc(c.why_mark)}</div>` : ""}</td>
