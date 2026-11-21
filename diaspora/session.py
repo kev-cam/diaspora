@@ -17,6 +17,7 @@ import os
 import re
 import time
 
+from . import discuss as D
 from . import ledger as L
 from . import scan
 from . import tried as T
@@ -30,7 +31,7 @@ PORT_SCHEMA = {
     "type": "object",
     "properties": {
         "status": {"type": "string", "enum": [
-            "ported", "not-applicable", "superseded", "failed"]},
+            "ported", "partial", "not-applicable", "superseded", "failed"]},
         "summary": {"type": "string"},
     },
     "required": ["status", "summary"],
@@ -56,7 +57,7 @@ Commit {sha}:
 See it with `git show {sha}`.
 
 State of the working tree: {state}
-{divergence}{history}
+{divergence}{history}{guidance}{how}
 Do this:
  1. Resolve every conflict and check that the applied hunks make sense
     against the code here.  Where the code here has diverged, re-implement
@@ -72,10 +73,24 @@ Do not commit, do not switch or create branches, do not push, and leave
 {meta} and files unrelated to this change alone.  The tool commits and
 runs the tests after you finish.
 
-Report `status` (ported | not-applicable | superseded | failed) and a
-`summary` of what you did or why it failed: one sentence, at most 150
+Report `status` (ported | not-applicable | superseded | failed{partial})
+and a `summary` of what you did or why it failed: one sentence, at most 150
 characters; it goes into the ledger.
 """
+
+MERGE_HOW = """
+You were asked to MERGE this commit: combine the two lines of development
+rather than pick a side or re-write ours in the peer's image.  Keep
+everything our code does and add what the commit does; where both changed
+the same code, write code that does both.  The conflict markers show the
+common ancestor as well (the ||||||| section), so you can tell what each
+side changed.  Best effort: if part of the commit cannot be combined with
+our code, bring what can be, leave the rest out, and report "partial" with
+what was left out in the summary.
+"""
+
+# a merge is best effort: more tries at repairing what the tests find
+MERGE_FIX_ATTEMPTS = 3
 
 FIX_PROMPT = """\
 The commit at HEAD of this working tree ({ws}) is an import of commit
@@ -84,7 +99,7 @@ required test level "{level}" failed.  The same level passes without the
 import.
 
 Test command: {command}
-{detail}{history}End of the log ({log}):
+{detail}{history}{guidance}End of the log ({log}):
 ---
 {tail}
 ---
@@ -207,7 +222,9 @@ class Session:
         return self.data["dir"] == "export"
 
     # -- starting -------------------------------------------------------------
-    def start(self, direction, target, commits, verdicts=(), peer=None):
+    def start(self, direction, target, commits, verdicts=(), peer=None,
+              how=None):
+        """`how`: {sha: "merge"} for commits to merge rather than port."""
         if self.exists():
             raise DiasporaError(
                 "a diaspora run is already in progress; see `diaspora "
@@ -231,8 +248,11 @@ class Session:
             "peer": peer.name if peer else None,
             "verdicts": list(verdicts), "entries": [],
             "ledger_commit": False,
-            "items": [{"peer": c.peer, "sha": c.sha, "subject": c.subject,
-                       "kind": c.kind, "state": "queued", "note": ""}
+            "items": [dict({"peer": c.peer, "sha": c.sha,
+                            "subject": c.subject, "kind": c.kind,
+                            "state": "queued", "note": ""},
+                           **({"how": how[c.sha]} if (how or {}).get(c.sha)
+                              else {}))
                       for c in commits],
         }
         self._tester()
@@ -486,9 +506,14 @@ class Session:
         commit = scan.one(self.repo, item["sha"])
         self._reset("HEAD")          # leftovers of an interrupted attempt
         item["head0"] = self.ws.head()
+        merge = item.get("how") == "merge"
+        guided = not self.export and bool(D.Discussion(self.repo).thread(
+            item["sha"]))
         try:
-            proc = self.ws.proc("cherry-pick", "--no-commit", item["sha"],
-                                check=False)
+            # a merge shows the common ancestor in its conflicts too
+            style = ["-c", "merge.conflictStyle=zdiff3"] if merge else []
+            proc = self.ws.proc(*(style + ["cherry-pick", "--no-commit",
+                                           item["sha"]]), check=False)
             self._drop(scan.dropped_paths(self.conf, peer, commit,
                                           self.data["dir"]))
             unmerged = self._unmerged()
@@ -500,25 +525,40 @@ class Session:
             rewritten = (not self.export
                          and self.conf.rewritten.any(commit.paths))
             adapted = False
-            if unmerged or rewritten:
-                self.ui.step("cherry-pick: %s" % (
-                    "conflicts in " + ", ".join(unmerged[:4])
-                    + (" ..." if len(unmerged) > 4 else "") if unmerged
-                    else "applies, but touches code rewritten here"))
+            guided = guided and self.agent.port_enabled
+            if unmerged or rewritten or guided:
+                what = ("conflicts in " + ", ".join(unmerged[:4])
+                        + (" ..." if len(unmerged) > 4 else "") if unmerged
+                        else "applies, but touches code rewritten here"
+                        if rewritten else
+                        "clean; the agent checks it against the discussion")
+                self.ui.step("cherry-pick: %s" % what)
                 if self.agent.port_enabled:
-                    status, summary = self._port(item, commit, unmerged)
-                    self._tried(item, "%s; agent: %s - %s" % (
+                    # (to tell whether the agent changed a clean pick)
+                    before = None if unmerged else self.ws.git(
+                        "write-tree")
+                    status, summary = self._port(item, commit, unmerged,
+                                                 rewritten)
+                    self._tried(item, "%s%s; agent: %s - %s" % (
                         "cherry-pick: conflicts in " + ", ".join(unmerged)
                         if unmerged else "cherry-pick applies, but touches "
-                        "code rewritten here", status, summary))
+                        "code rewritten here" if rewritten else
+                        "cherry-pick: clean", "; asked to merge" if merge
+                        else "", status, summary))
                     if status in (L.SUPERSEDED, L.NOT_APPLICABLE):
                         self._reset(item["head0"])
                         item["state"], item["note"] = status, summary
                         return None
-                    if status != "ported":
-                        return self._fail(item, "agent could not port it: "
-                                          + summary, tried=False)
+                    if status == "partial" and merge:
+                        summary = "merged in part: " + summary
+                    elif status != "ported":
+                        return self._fail(item, "agent could not %s it: %s"
+                                          % ("merge" if merge else "port",
+                                             summary), tried=False)
                     adapted, item["note"] = True, summary
+                    if before and not self._unmerged():
+                        self.ws.git("add", "--update")
+                        adapted = self.ws.git("write-tree") != before
                 elif unmerged and self.interactive:
                     item["state"], item["note"] = "paused", "conflict"
                     return None
@@ -589,16 +629,21 @@ class Session:
         if extra:
             self.ui.step("also changed: " + ", ".join(extra))
 
-    def _port(self, item, commit, unmerged):
+    def _port(self, item, commit, unmerged, rewritten=True):
         peer = self.conf.peer(item["peer"])
+        merge = item.get("how") == "merge"
         if unmerged:
             state = ("`git cherry-pick --no-commit %s` stopped with "
                      "conflicts in: %s." % (item["sha"][:12],
                                             ", ".join(unmerged)))
-        else:
+        elif rewritten:
             state = ("the cherry-pick applied without conflicts, but it "
                      "touches code this repository has rewritten, so the "
                      "literal diff may be wrong here.")
+        else:
+            state = ("the cherry-pick applied without conflicts.  Look it "
+                     "over against the discussion below, and change it as "
+                     "the person asked.")
         divergence = ""
         if not self.export and (self.conf.rewritten or self.conf.removed):
             divergence = ("\nHow this repository differs from its peers: "
@@ -616,8 +661,12 @@ class Session:
             source=source, dest=dest, ws=self.ws.path, sha=item["sha"],
             message=(commit.subject + "\n\n" + commit.body).strip(),
             state=state, divergence=divergence, history=self._history(item),
+            guidance="" if self.export else D.guidance(self.repo,
+                                                       item["sha"]),
+            how=MERGE_HOW if merge else "",
+            partial=" | partial" if merge else "",
             meta="diaspora.conf, %s, %s" % (self.conf.ledger, self.conf.log))
-        self.ui.step("agent: porting ...")
+        self.ui.step("agent: %s ..." % ("merging" if merge else "porting"))
         answer = self.agent.ask("port", prompt, PORT_SCHEMA, cwd=self.ws.path)
         if not answer:
             return "failed", self.agent.last_error or "no answer"
@@ -696,6 +745,8 @@ class Session:
             return
         attempts = self.conf.agent.fix_attempts if self.agent.port_enabled \
             else 0
+        if item.get("how") == "merge" and self.agent.port_enabled:
+            attempts = max(attempts, MERGE_FIX_ATTEMPTS)
         tag = "%s-%s" % (item["peer"], item["sha"][:10])
         while True:
             ok, level, log = self.tester.run(
@@ -730,7 +781,9 @@ class Session:
             detail="Tests that pass without the import and fail with it: "
                    "%s (full list: %s).  Tests that failed before are not "
                    "your concern.\n" % (detail, log[:-4] + ".new-failures")
-            if detail else "", history=self._history(item))
+            if detail else "", history=self._history(item),
+            guidance="" if self.export else D.guidance(self.repo,
+                                                       item["sha"]))
         # tracked files the build itself changed (a regenerated configure,
         # say) are not part of the repair
         built = set(self.ws.git("diff", "--name-only").splitlines())

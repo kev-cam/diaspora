@@ -1281,6 +1281,92 @@ class AutoTests(World):
         self.assertNotEqual(git(self.ours, "rev-parse", "main"), tip)
 
 
+class MergeDiscussTests(World):
+    """Merge (combine the code, best effort) and Discuss (say how)."""
+
+    def setUp(self):
+        super().setUp()
+        self.use_fake_agent()
+        self.prompts = os.path.join(self.tmp, "prompts")
+        os.environ["FAKE_PROMPT_LOG"] = self.prompts
+        for name in ("FAKE_REPLY",):
+            os.environ.pop(name, None)
+
+    def said(self):
+        with open(self.prompts) as handle:
+            return handle.read()
+
+    def modes(self):
+        with open(os.environ["FAKE_AGENT_LOG"]) as handle:
+            return handle.read().split()
+
+    def test_merge_shows_the_ancestor_and_may_be_partial(self):
+        os.environ["FAKE_PORT"] = "partial"
+        self.run_cli("import", "--merge", self.p4[:10], "--yes", code=0)
+        entry = self.ledger()[self.p4]
+        self.assertEqual(entry["verdict"], "adapted")
+        self.assertEqual(entry["note"], "merged in part: took the peer's side")
+        said = self.said()
+        self.assertIn("You were asked to MERGE this commit", said)
+        self.assertIn("ported | not-applicable | superseded | failed | "
+                      "partial", said)
+        # zdiff3: the conflict shows the common ancestor's line too
+        self.assertRegex(said, r"<<<<<<< .*\nline2 ours\n\|\|\|\|\|\|\| "
+                         r".*\nline2\n=======\nline2 peer fix\n>>>>>>> ")
+        self.assertIn("Diaspora-Origin: up@%s (adapted)" % self.p4,
+                      git(self.ours, "log", "--format=%B", "main"))
+
+    def test_partial_is_only_for_a_merge(self):
+        os.environ["FAKE_PORT"] = "partial"
+        self.run_cli("import", "--pick", self.p4[:10], "--yes", code=4)
+        self.assertEqual(self.ledger()[self.p4]["verdict"], "failed")
+        self.assertNotIn("asked to MERGE", self.said())
+
+    def test_a_merge_gets_more_repairs(self):
+        os.environ["FAKE_FIX"] = "echo x >> src/a.c"     # never mends it
+        self.run_cli("import", "--merge", self.p5[:10], "--yes", code=4)
+        self.assertEqual(self.modes().count("fix"), 3)
+
+    def test_discuss_on_the_command_line(self):
+        out = self.run_cli("discuss", self.p4[:10], code=0)
+        self.assertIn("No discussion of", out)
+        out = self.run_cli("discuss", self.p4[:10], "-m",
+                           "Keep our line2 wording, add the peer's fix",
+                           code=0)
+        self.assertIn("you (", out)
+        self.assertIn("Keep our line2 wording", out)
+        os.environ["FAKE_REPLY"] = "I would merge both edits of line2"
+        out = self.run_cli("discuss", self.p4[:10], "--ask", code=0)
+        self.assertIn("agent (", out)
+        self.assertIn("I would merge both edits of line2", out)
+        self.assertEqual(self.modes(), ["discuss"])
+        said = self.said()
+        self.assertIn("Keep our line2 wording", said)
+        self.assertIn("do not change any file", said)
+        # the agent answers you, not itself
+        self.run_cli("discuss", self.p4[:10], "--ask", code=1)
+        self.assertIn("say something first", self.last_err)
+        self.assertIn("discussed (`diaspora discuss`)",
+                      self.run_cli("show", self.p4[:10], code=0))
+        self.run_cli("discuss", self.p4[:10], "--clear", code=0)
+        self.assertIn("No discussion of",
+                      self.run_cli("discuss", self.p4[:10], code=0))
+
+    def test_a_discussed_commit_is_imported_as_discussed(self):
+        self.run_cli("discuss", self.p1[:10], "-m",
+                     "Return 3, not 2: our callers count from 3", code=0)
+        # it applies cleanly; the agent looks it over all the same
+        out = self.run_cli("import", "--pick", self.p1[:10], "--yes", code=0)
+        self.assertIn("clean; the agent checks it against the discussion",
+                      out)
+        self.assertEqual(self.modes(), ["port"])
+        said = self.said()
+        self.assertIn("Return 3, not 2", said)
+        self.assertIn("Look it over against the discussion", said)
+        # the agent changed nothing: as applied
+        self.assertEqual(self.ledger()[self.p1]["verdict"], "applied")
+
+
 class GuiTests(World):
     """The browser page's server, driven over HTTP as the page drives it."""
 
@@ -1355,6 +1441,36 @@ class GuiTests(World):
         page = self.call("/")[1]
         self.assertIn("touches ours", page)
         self.assertIn("no overlap", page)
+
+    def test_merge_and_discuss(self):
+        self.use_fake_agent()
+        self.app.args.no_agent = False
+        os.environ["FAKE_PROMPT_LOG"] = os.path.join(self.tmp, "prompts")
+        code, out = self.call("/api/mark", {"commits": [self.p1],
+                                            "mark": "discuss"})
+        self.assertEqual(code, 400)
+        self.assertIn("say how it should be imported first", out["error"])
+        code, out = self.call("/api/discuss", {
+            "commit": self.p1, "text": "Keep it small", "ask": True})
+        self.assertEqual(code, 200, out)
+        self.assertEqual([m["who"] for m in out["thread"]], ["you", "agent"])
+        self.assertEqual(out["thread"][1]["text"], "fake reply")
+        state = self.call("/api/state")[1]
+        c1 = next(c for c in state["commits"] if c["commit"] == self.p1)
+        self.assertEqual(len(c1["discussion"]), 2)
+        self.post("/api/mark", {"commits": [self.p1], "mark": "discuss"})
+        self.post("/api/mark", {"commits": [self.p4], "mark": "merge"})
+        self.post("/api/apply", {})
+        run = self.call("/api/state")[1]["run"]
+        how = {i["sha"]: i["how"] for i in run["items"]}
+        self.assertEqual(how, {self.p1: None, self.p4: "merge"})
+        with open(os.environ["FAKE_PROMPT_LOG"]) as handle:
+            said = handle.read()
+        self.assertIn("Keep it small", said)
+        self.assertIn("You were asked to MERGE", said)
+        code, out = self.call("/api/discuss", {"commit": self.p1,
+                                               "clear": True})
+        self.assertEqual(out["thread"], [])
 
     def test_auto_import(self):
         code, plan = self.call("/api/plan")

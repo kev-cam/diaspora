@@ -3,10 +3,13 @@
 
 A small web server on 127.0.0.1 (standard library only) serves one page.
 Every candidate commit can be marked accept (import it, through the test
-gate), reject (never suggest it again), defer (hide it until asked), or
-retry (import again a commit that failed before; diaspora.log tells the
-agent how it went).  Apply records the rejections and deferrals and starts
-one import run with the accepted commits.  The run is left on its branch;
+gate), retry (import again a commit that failed before; diaspora.log tells
+the agent how it went), merge (import it, and where it does not apply have
+the agent combine it with our code, best effort), discuss (say how it
+should be imported, ask the agent how it would do it, then import it so),
+reject (never suggest it again) or defer (hide it until asked).  Apply
+records the rejections and deferrals and starts one import run with the
+others.  The run is left on its branch;
 the page promotes it to the target ("accept the run") or drops it.
 
 Requests must carry the token printed in the URL, and a Host of this
@@ -27,6 +30,7 @@ import types
 import urllib.parse
 import webbrowser
 
+from . import discuss as D
 from . import ledger as L
 from . import plan as P
 from . import tried as T
@@ -37,7 +41,8 @@ from .ui import UI
 from .userconf import UserConf
 from .workspace import Tester, Workspace, fmt_secs
 
-MARKS = ("accept", "reject", "defer", "retry")
+MARKS = ("accept", "retry", "merge", "discuss", "reject", "defer")
+IMPORTS = ("accept", "retry", "merge", "discuss")
 
 
 class PageUI(UI):
@@ -229,11 +234,13 @@ class App:
         conf = self.conf()
         target = self.target(conf)
         by_sha = {c.sha: c for c in self.commits}
-        selected, entries = [], []
+        selected, entries, how = [], [], {}
         for commit in self.commits:            # in the scan's order
             mark = self.marks.get(commit.sha)
-            if mark in ("accept", "retry"):
+            if mark in IMPORTS:
                 selected.append(commit)
+                if mark == "merge":
+                    how[commit.sha] = "merge"
             elif mark in ("reject", "defer"):
                 entries.append(L.entry(
                     commit.peer, commit.sha,
@@ -246,7 +253,8 @@ class App:
         if selected:
             session = Session(self.repo, conf, self.ui, agent,
                               interactive=False, assume_yes=False)
-            status = session.start("import", target, selected, entries)
+            status = session.start("import", target, selected, entries,
+                                   how=how)
         else:
             record(self.repo, conf, self.ui, agent, target, entries)
             status = "recorded"
@@ -337,11 +345,13 @@ class App:
         conf = self.conf()
         target = self.target(conf)
         log = T.Log.at(self.repo, target, conf.log)
+        disc = D.Discussion(self.repo)
         commits = []
         for commit in self.commits:
             item = commit.as_dict()
             item["short"] = commit.short
             item["tried"] = log.about(commit.sha)
+            item["discussion"] = disc.thread(commit.sha)
             item["mark"] = self.marks.get(commit.sha)
             item["why_mark"] = self.notes.get(commit.sha, "")
             commits.append(item)
@@ -356,7 +366,8 @@ class App:
             items = []
             for i in data["items"]:
                 item = {k: i.get(k) for k in (
-                    "peer", "sha", "subject", "state", "note", "mode")}
+                    "peer", "sha", "subject", "state", "note", "mode",
+                    "how")}
                 if i["state"] == "failed":
                     item["choice"] = choices.get(i["sha"], "failed")
                     item["can_include"] = bool(
@@ -545,6 +556,42 @@ class App:
             text = text[:400000] + "\n... (cut)"
         return {"text": text}
 
+    def discussion(self, sha):
+        commit = next((c for c in self.commits if c.sha == sha), None)
+        if commit is None:
+            raise DiasporaError("%s is not in the list" % sha)
+        return {"commit": sha, "short": commit.short,
+                "subject": commit.subject, "peer": commit.peer,
+                "thread": D.Discussion(self.repo).thread(sha),
+                "mark": self.marks.get(sha)}
+
+    def discuss(self, sha, text="", ask=False, clear=False):
+        """Add to the discussion of `sha`; with `ask`, the agent answers
+        (this takes as long as the agent does: the page waits)."""
+        commit = next((c for c in self.commits if c.sha == sha), None)
+        if commit is None:
+            raise DiasporaError("%s is not in the list" % sha)
+        disc = D.Discussion(self.repo)
+        if clear:
+            disc.clear(sha)
+            if self.marks.get(sha) == "discuss":
+                self.marks.pop(sha, None)
+            return self.discussion(sha)
+        disc.add(sha, "you", text)
+        if ask:
+            conf = self.conf()
+            agent = self.agent(conf)
+            if not agent.enabled:
+                raise DiasporaError("no agent to ask")
+            try:
+                D.reply(self.repo, conf, agent, conf.peer(commit.peer), sha,
+                        self.target(conf), commit)
+            except (ValueError, RuntimeError) as exc:
+                raise DiasporaError(str(exc))
+            finally:
+                self.agent_cost += agent.cost
+        return self.discussion(sha)
+
     def mark(self, shas, mark, why=""):
         known = {c.sha: c for c in self.commits}
         for sha in shas:
@@ -554,6 +601,10 @@ class App:
                 self.marks.pop(sha, None)
                 self.notes.pop(sha, None)
             elif mark in MARKS:
+                if mark == "discuss" and not D.Discussion(
+                        self.repo).thread(sha):
+                    raise DiasporaError("say how it should be imported "
+                                        "first")
                 self.marks[sha] = mark
                 if why:
                     self.notes[sha] = why
@@ -616,6 +667,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if url.path == "/api/runlog":
                 return self._json(200, self.app.run_log(
                     (query.get("commit") or [""])[0]))
+            if url.path == "/api/discuss":
+                return self._json(200, self.app.discussion(
+                    (query.get("commit") or [""])[0]))
             if url.path == "/api/show":
                 return self._json(200, self.app.show(
                     (query.get("commit") or [""])[0],
@@ -663,6 +717,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 app.start("auto-import", app.do_auto,
                           bool(body.get("review")),
                           int(body.get("size") or 0), shown)
+            elif url.path == "/api/discuss":
+                return self._json(200, app.discuss(
+                    body.get("commit", ""), str(body.get("text") or ""),
+                    bool(body.get("ask")), bool(body.get("clear"))))
             elif url.path == "/api/choose":
                 app.choose(body.get("commit", ""), body.get("choice", ""))
             elif url.path == "/api/run":
@@ -721,6 +779,7 @@ PAGE = r"""<!doctype html>
   --bg: #f7f7f5; --panel: #ffffff; --ink: #1d1d1b; --dim: #6b6b66;
   --line: #e2e1dc; --accent: #2f5fd0; --ok: #1f7a3d; --bad: #b3261e;
   --warn: #8a5a00; --defer: #6b5ca5; --mark-bg: #eef2fd; --on-ink: #ffffff;
+  --merge: #0f766e;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 @media (prefers-color-scheme: dark) {
@@ -728,6 +787,7 @@ PAGE = r"""<!doctype html>
     --bg: #161615; --panel: #1f1f1d; --ink: #e8e7e3; --dim: #9a9993;
     --line: #34332f; --accent: #7fa2ff; --ok: #5cc27e; --bad: #ff7b72;
     --warn: #e0b34f; --defer: #b0a2f0; --mark-bg: #232a3d; --on-ink: #10110f;
+    --merge: #4fd1c5;
   }
 }
 * { box-sizing: border-box; }
@@ -786,6 +846,21 @@ td.acts button { padding: 2px 8px; font-size: 12.5px; }
 td.acts button.on.accept, td.acts button.on.retry { background: var(--ok); color: var(--on-ink); border-color: var(--ok); }
 td.acts button.on.reject { background: var(--bad); color: var(--on-ink); border-color: var(--bad); }
 td.acts button.on.defer { background: var(--defer); color: var(--on-ink); border-color: var(--defer); }
+td.acts button.on.merge { background: var(--merge); color: var(--on-ink); border-color: var(--merge); }
+td.acts button.on.discuss { background: var(--accent); color: var(--on-ink); border-color: var(--accent); }
+td.acts button.discuss.has:not(.on) { border-color: var(--accent); color: var(--accent); }
+td.subj .disc { color: var(--accent); font-size: 12.5px; }
+.run .how { font-family: system-ui, sans-serif; font-size: 11.5px; color: var(--merge); }
+#discdlg .thread { padding: 6px 14px; overflow: auto; max-height: calc(88vh - 260px); }
+#discdlg .msg { margin: 8px 0; padding: 8px 10px; border-radius: 8px;
+  border: 1px solid var(--line); white-space: pre-wrap; font-size: 13px; }
+#discdlg .msg.you { background: var(--mark-bg); }
+#discdlg .msg .who { font-size: 11.5px; color: var(--dim); margin-bottom: 2px; }
+#discdlg .say { padding: 8px 14px 12px; border-top: 1px solid var(--line); }
+#discdlg textarea { width: 100%; min-height: 5.5em; font: inherit; color: var(--ink);
+  background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+#discdlg .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 8px; }
+#discdlg .row .dim { flex: 1; font-size: 12.5px; }
 .badge { display: inline-block; font-size: 11.5px; padding: 0 6px;
   border-radius: 9px; border: 1px solid var(--line); color: var(--dim);
   margin-left: 4px; white-space: nowrap; }
@@ -891,6 +966,20 @@ dialog pre { margin: 0; padding: 12px 14px; font-family: var(--mono); font-size:
     <label><input type="checkbox" id="planreview"> also commits listed for review that the agent says to import</label>
   </div>
   <div id="plantext"></div>
+</dialog>
+<dialog id="discdlg">
+  <div class="head"><span class="t" id="disct"></span>
+    <button id="discforget" data-tip="forget">Forget</button>
+    <button id="discclose">Close</button></div>
+  <div class="thread" id="discthread"></div>
+  <div class="say">
+    <textarea id="disctext" autofocus placeholder="How should this commit come in? e.g. “take only the parser change, keep our error messages”, or ask a question."></textarea>
+    <div class="row">
+      <span class="dim" id="discstate"></span>
+      <button id="discask" data-tip="ask">Ask the agent</button>
+      <button id="discmark" class="primary" data-tip="discussmark">Import as discussed</button>
+    </div>
+  </div>
 </dialog>
 <div id="tip" role="tooltip"></div>
 <script>
@@ -1042,6 +1131,29 @@ function help(what, el) {
       conflicts, <b>${esc(gate())}</b>, then your <b>Accept: promote</b>.</p>
       <p>The agent is told how the earlier attempts went (from diaspora.log),
       so it need not repeat them.</p>`,
+    merge: `<p><b>Import it, combining the code.</b> As Accept, but where the
+      commit does not apply, the agent merges it with our code instead of
+      porting it over: it keeps everything ours does and adds what the commit
+      does, writing code that does both where both changed the same lines
+      (the conflicts show the common ancestor too).</p>
+      <p>Best effort: what cannot be combined is left out and the run says
+      what. It still has to pass <b>${esc(gate())}</b>, and the agent gets
+      more tries at repairing what the tests find.</p>`,
+    discuss: `<p><b>Say how it should come in.</b> Opens a discussion of this
+      commit: write what to take, what to adapt, what to leave out, or ask a
+      question; <b>Ask the agent</b> gets its answer: how it would do it,
+      reading the commit and our code, changing nothing.</p>
+      <p><b>Import as discussed</b> marks it: Apply imports it, and the agent
+      follows the discussion, looking the import over even when it applies
+      cleanly. The discussion is kept, and given to the agent whenever this
+      commit is imported.</p>`,
+    ask: `<p>The agent reads the commit, our code and the discussion, and
+      answers your last message: how it would bring the commit in. It changes
+      nothing. This takes as long as the agent does (a minute or two).</p>`,
+    discussmark: `<p>Marks the commit to be imported following this
+      discussion; nothing happens until you press <b>Apply</b>.</p>`,
+    forget: `<p>Deletes this commit's discussion (kept in
+      .git/diaspora/discussion.json, this clone only).</p>`,
     reject: `<p><b>Not wanted here.</b> Apply records it as <i>rejected</i>,
       with your reason, in diaspora.ledger, committed on ${tgt}.
       diaspora will not suggest it again.</p>
@@ -1074,14 +1186,15 @@ function help(what, el) {
       passed, untested together with them; use it when the failure is not
       the commit's fault, e.g. a test that needs something this machine lacks.</p>`,
     apply: `<p>Carries out the marks: <i>reject</i> and <i>defer</i> are recorded
-      in diaspora.ledger on ${tgt}; <i>accept</i> and <i>retry</i> start one
-      import run (test branch, <b>${esc(gate())}</b>).</p>
+      in diaspora.ledger on ${tgt}; <i>accept</i>, <i>retry</i>,
+      <i>merge</i> and <i>discuss</i> start one import run (test branch,
+      <b>${esc(gate())}</b>).</p>
       <p>${tgt} itself changes only when you press <b>Accept: promote</b>
       on the finished run.</p>`,
   }[what];
   const wait = what === "apply" && S.run ?
     `<p><b>Finish the run above first</b> (promote it or drop it).</p>` : "";
-  const own = what === "apply" || what === "promote" || what === "abort" || what === "choice";
+  const own = ["apply", "promote", "abort", "choice", "ask", "discussmark", "forget"].includes(what);
   return tip ? wait + tip + (own ? "" : later) : "";
 }
 let tipFor = null, tipTimer = 0;
@@ -1137,9 +1250,10 @@ function renderRows() {
   const multi = S.peers.length > 1;
   setHTML($("rows"), list.map(c => {
     const again = c.status === "failed" || c.tried.length;
-    const opts = again ? ["retry", "reject", "defer"] : ["accept", "reject", "defer"];
+    const opts = [again ? "retry" : "accept", "merge", "discuss", "reject", "defer"];
     const held = S.run && S.run.items.some(i => i.sha === c.commit);
-    const btns = opts.map(m => `<button class="${m}${c.mark === m ? " on" : ""}"
+    const has = c.discussion && c.discussion.length;
+    const btns = opts.map(m => `<button class="${m}${c.mark === m ? " on" : ""}${m === "discuss" && has ? " has" : ""}"
       data-sha="${c.commit}" data-mark="${m}" data-tip="${m}" ${busy || held ? "disabled" : ""}>${
       m[0].toUpperCase() + m.slice(1)}</button>`).join(" ");
     const agent = c.triage === "agent" ? `agent${c.risk ? ", risk " + esc(c.risk) : ""}: ${
@@ -1154,12 +1268,16 @@ function renderRows() {
       <td class="subj">${esc(c.subject)} ${label(c)}${overlap(c)}
         ${agent ? `<div class="note">${agent}</div>` : ""}
         ${t ? `<div class="tried">${esc(t)}</div>` : ""}
-        ${c.why_mark ? `<div class="note">why: ${esc(c.why_mark)}</div>` : ""}</td>
+        ${c.why_mark ? `<div class="note">why: ${esc(c.why_mark)}</div>` : ""}
+        ${has ? `<div class="disc">discussed (${c.discussion.length}): ${
+          esc(c.discussion[c.discussion.length - 1].who)}: ${
+          esc(c.discussion[c.discussion.length - 1].text.slice(0, 110))}${
+          c.discussion[c.discussion.length - 1].text.length > 110 ? " …" : ""}</div>` : ""}</td>
       <td class="acts">${btns}</td></tr>`;
   }).join(""));
   const n = m => S.commits.filter(c => c.mark === m).length;
   $("counts").textContent = `${list.length} shown of ${S.commits.length}`;
-  const a = n("accept") + n("retry"), r = n("reject"), d = n("defer");
+  const a = n("accept") + n("retry") + n("merge") + n("discuss"), r = n("reject"), d = n("defer");
   $("apply").disabled = blocked || !(a + r + d);
   $("apply").textContent = a ? `Import ${a}` + (r + d ? `, record ${r + d}` : "") :
     (r + d ? `Record ${r + d}` : "Apply");
@@ -1213,6 +1331,7 @@ function renderRun() {
   setHTML(el, `<h2>Run ${esc(R.id)} <span class="dim">· ${stage} · branch ${esc(R.branch)}</span></h2>
     <div class="items">${R.items.map(i => `<div class="item"><span class="st-${esc(i.state)}">${
       esc((word[i.state] || i.state).padEnd(10))}</span> ${esc(i.sha.slice(0, 10))} ${esc(i.subject)}${
+      i.how === "merge" ? ` <span class="how">merge</span>` : ""}${
       i.note ? ` <span class="dim">— ${esc(i.note.replace(/ \(log: [^)]*\)/, ""))}</span>` : ""}${choice(i)}</div>`).join("")}</div>
     <div class="actions">${acts}</div>`);
 }
@@ -1326,6 +1445,7 @@ document.addEventListener("click", ev => {
   if (!b) return;
   if (b.dataset.show) return showCommit(b.dataset.show, false);
   if (b.dataset.repo) return act("/api/repo", {name: b.dataset.repo});
+  if (b.dataset.mark === "discuss") return showDiscuss(b.dataset.sha);
   if (b.dataset.mark) {
     const c = S.commits.find(x => x.commit === b.dataset.sha);
     let mark = b.dataset.mark, why = "";
@@ -1362,6 +1482,68 @@ async function showRunLog(sha) {
   try { $("dlgtext").textContent = (await api("/api/runlog?commit=" + sha)).text; }
   catch (e) { $("dlgtext").textContent = e.message; }
 }
+// discuss: a conversation about how to import one commit
+let disc = null;
+async function showDiscuss(sha) {
+  disc = {commit: sha, thread: [], mark: null};
+  $("disct").textContent = "discuss";
+  $("discthread").innerHTML = '<p class="dim">loading …</p>';
+  $("disctext").value = "";
+  $("discstate").textContent = "";
+  if (!$("discdlg").open) $("discdlg").showModal();
+  $("disctext").focus();
+  try { disc = await api(`/api/discuss?commit=${sha}`); renderDiscuss(); }
+  catch (e) { $("discthread").innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+}
+function renderDiscuss(waiting) {
+  const d = disc;
+  $("disct").textContent = `discuss ${d.short} ${d.subject}`;
+  $("discthread").innerHTML = (d.thread.length ? d.thread.map(m =>
+    `<div class="msg ${esc(m.who)}"><div class="who">${esc(m.who)} · ${esc(m.date)}</div>${esc(m.text)}</div>`).join("")
+    : `<p class="dim">Nothing said yet. Say how this commit should be brought in;
+       the agent can answer with how it would do it.</p>`) +
+    (waiting ? '<p class="dim">the agent is reading the commit and our code …</p>' : "");
+  $("discthread").scrollTop = 1e9;
+  const busy = !!waiting || !!(S && S.busy);
+  $("discask").disabled = busy;
+  $("discmark").disabled = busy;
+  $("discforget").disabled = busy || !d.thread.length;
+  $("discmark").textContent = d.mark === "discuss" ? "Unmark" : "Import as discussed";
+  $("discstate").textContent = d.mark === "discuss" ? "marked: Apply imports it as discussed" : "";
+}
+async function discSay(ask) {
+  const text = $("disctext").value.trim();
+  if (ask && !text && !(disc.thread.length && disc.thread[disc.thread.length - 1].who === "you"))
+    return alert("Say something first: the agent answers you.");
+  renderDiscuss(ask);
+  if (ask && text) disc.thread.push({who: "you", date: "now", text}), renderDiscuss(true);
+  try {
+    disc = await api("/api/discuss", {commit: disc.commit, text, ask});
+    $("disctext").value = "";
+  } catch (e) { alert(e.message); }
+  renderDiscuss();
+  refresh();
+}
+$("discask").onclick = () => discSay(true);
+$("discmark").onclick = async () => {
+  if (disc.mark === "discuss") {
+    await act("/api/mark", {commits: [disc.commit], mark: "clear"});
+    disc.mark = null; return renderDiscuss();
+  }
+  if ($("disctext").value.trim()) await discSay(false);
+  if (!disc.thread.length) return alert("Say how it should be imported first.");
+  try { await api("/api/mark", {commits: [disc.commit], mark: "discuss"}); }
+  catch (e) { return alert(e.message); }
+  $("discdlg").close(); refresh();
+};
+$("discforget").onclick = async () => {
+  if (!confirm("Forget this discussion?")) return;
+  try { disc = await api("/api/discuss", {commit: disc.commit, clear: true}); }
+  catch (e) { alert(e.message); }
+  renderDiscuss(); refresh();
+};
+$("discclose").onclick = () => $("discdlg").close();
+
 async function showTests() {
   shown = null;
   $("dlgt").textContent = "testing an import must pass";

@@ -455,7 +455,8 @@ has been offered so it is not offered twice.
 | `diaspora list [peer...]` | list only; `--json`, `--all`, `--max N` |
 | `diaspora export <peer>` | prepare a branch of our commits for a peer |
 | `diaspora status` | peers, ledger counts, the run in progress |
-| `diaspora show <commit>` | a candidate, with its triage, verdict and earlier attempts |
+| `diaspora show <commit>` | a candidate, with its triage, verdict, earlier attempts and discussion |
+| `diaspora discuss <commit> [-m text] [--ask]` | say how a commit should be imported; the agent answers how it would do it |
 | `diaspora continue` / `skip` / `abort` | after a conflict: go on, leave the commit out, drop the run (what did not work is still recorded) |
 | `diaspora promote` | copy a finished run to the target branch |
 | `diaspora reject` / `defer` / `reopen` / `withhold <commit...>` | record a verdict without importing |
@@ -465,7 +466,8 @@ has been offered so it is not offered twice.
 | `diaspora fetch`, `diaspora log`, `diaspora init` | |
 
 Useful options to `import`: `--yes` (take the suggested commits and promote
-without asking), `--pick <commit>`, `--no-agent`, `--no-fetch`,
+without asking), `--pick <commit>`, `--merge <commit>` (take it and combine
+it with our code where it does not apply), `--no-agent`, `--no-fetch`,
 `--strategy batch`, `--no-promote`, `--target <branch>`, `--here` (import
 into the branch you are on, whatever `target` says), `-v` (show test
 output as it runs).
@@ -607,8 +609,33 @@ one can be marked:
 |---|---|
 | Accept | imports it, through the test gate |
 | Retry | the same, for a commit that failed before (`[!]`); the agent is told how |
+| Merge | imports it, combining the code where it does not apply (below) |
+| Discuss | opens a discussion: you say how it should come in, the agent can answer; then imports it so (below) |
 | Reject | records `rejected` (with the reason you give): never suggested again |
 | Defer | records `deferred`: hidden until "show ignored and deferred" |
+
+**Merge.** Where a commit does not apply, the agent normally ports its
+*intent* into our code. Merge asks for the other thing: combine the two.
+The conflicts are given with the common ancestor (`zdiff3`), and the agent
+keeps everything our code does and adds what the commit does, writing code
+that does both where both changed the same lines. It is best effort: what
+cannot be combined is left out, the agent reports `partial`, and the ledger
+note says *merged in part* and what was left. The test gate still applies;
+a merge gets at least 3 repair attempts (`fix-attempts` otherwise). On the
+command line: `diaspora import --merge <commit>`.
+
+**Discuss.** Say how a commit should come in ("take only the parser
+change, keep our error messages", or a question); **Ask the agent** gets
+its answer, how it would do it, from reading the commit and our code
+(read-only, the porting model). Go back and forth as you like, then
+**Import as discussed** marks it for Apply. Whenever the commit is
+imported, by any route (Accept, Retry, Merge, auto-import, `--pick`), the
+agent porting or repairing it is given the discussion, and looks the
+import over against it even when the cherry-pick applied cleanly (if it
+changes nothing, the import is still `applied`). The discussion is kept in
+`.git/diaspora/discussion.json` (this clone only); the list shows the last
+word under the subject. On the command line: `diaspora discuss <commit> -m
+"..." [--ask]`, `--clear` to forget it; `diaspora show` prints it.
 
 The gate in the page's header (`compile → full-regression`, say) is a
 link: it shows what an import must pass, for each peer and kind of change,

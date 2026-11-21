@@ -4,8 +4,11 @@
 
   triage  every commit in the prompt gets the answer in $FAKE_TRIAGE (JSON,
           {subject substring: {field: value}}), else bugfix/import
+  discuss answers $FAKE_REPLY, or "fake reply"
   port    takes the incoming side of every conflict, or does what
-          $FAKE_PORT says: "superseded", "not-applicable", "failed"
+          $FAKE_PORT says: "superseded", "not-applicable", "failed",
+          "partial" (as ported, reported partial); the conflicted files,
+          as the agent found them, go to $FAKE_PROMPT_LOG too
   fix     runs the shell command in $FAKE_FIX and reports "fixed"
 
 The mode goes to $FAKE_AGENT_LOG and the prompt to $FAKE_PROMPT_LOG.
@@ -42,9 +45,16 @@ if mode == "triage":
                 answer.update(fields)
         commits.append(answer)
     print(json.dumps({"commits": commits}))
+elif mode == "discuss":
+    print(json.dumps({"reply": os.environ.get("FAKE_REPLY", "fake reply")}))
 elif mode == "port":
     what = os.environ.get("FAKE_PORT", "ported")
-    if what != "ported":
+    with open(os.environ.get("FAKE_PROMPT_LOG", os.devnull), "a") as log:
+        for path in git("diff", "--name-only",
+                        "--diff-filter=U").splitlines():
+            with open(path) as handle:
+                log.write("--- conflicted %s\n%s" % (path, handle.read()))
+    if what not in ("ported", "partial"):
         git("reset", "--hard", "HEAD")
         print(json.dumps({"status": what, "summary": "fake says " + what}))
     else:
@@ -53,7 +63,7 @@ elif mode == "port":
             git("checkout", "--theirs", "--", path)
             git("add", "--", path)
         print("some chatter before the answer")
-        print(json.dumps({"status": "ported",
+        print(json.dumps({"status": what,
                           "summary": "took the peer's side"}))
 elif mode == "fix":
     command = os.environ.get("FAKE_FIX")

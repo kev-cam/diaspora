@@ -8,6 +8,7 @@ import sys
 import time
 
 from . import __version__, scan, triage
+from . import discuss as D
 from . import plan as P
 from . import ledger as L
 from . import tried as T
@@ -19,7 +20,8 @@ from .ui import UI
 from .userconf import UserConf
 from .workspace import Tester, Workspace
 
-COMMANDS = ("import", "auto", "list", "export", "status", "show", "continue", "skip",
+COMMANDS = ("import", "auto", "list", "export", "status", "show", "discuss",
+            "continue", "skip",
             "abort", "promote", "reject", "defer", "reopen", "withhold",
             "fetch", "log", "test", "init", "gui", "repos", "help")
 
@@ -208,7 +210,10 @@ def cmd_import(repo, ui, args, direction="import"):
                 "would land untested" % CONF_NAME)
     ui.say("")
 
-    picks = getattr(args, "pick", None)
+    merges = getattr(args, "merge", None) or []
+    picks = (getattr(args, "pick", None) or []) + merges
+    how = {c.sha: "merge" for c in resolve_picks(found, merges)} \
+        if merges else None
     if picks:
         selected, entries = resolve_picks(found, picks), []
     elif not shown:
@@ -244,7 +249,8 @@ def cmd_import(repo, ui, args, direction="import"):
     if selected:
         ui.say("")
         peer = peers[0] if direction == "export" else None
-        status = session.start(direction, target, selected, entries, peer)
+        status = session.start(direction, target, selected, entries, peer,
+                               how=how)
         code = exit_code(session, status)
     elif entries:
         record(repo, conf, ui, agent, target, entries)
@@ -511,8 +517,60 @@ def cmd_show(repo, ui, args):
                 " - " + item["note"] if item.get("note") else ""))
     for text in T.Log.at(repo, target, conf.log).about(commit.sha):
         ui.say("\ntried before (%s):\n%s" % (conf.log, text.rstrip()))
+    thread = D.Discussion(repo).thread(commit.sha)
+    if thread:
+        ui.say("\ndiscussed (`diaspora discuss`):\n" + D.as_text(thread))
     if not cached:
         ui.say("\nkind (from the message): %s" % commit.kind)
+    return 0
+
+
+def cmd_discuss(repo, ui, args):
+    """Say how a commit should be imported; the agent can answer."""
+    conf = Config.load(repo)
+    sha = repo.rev(args.commit)
+    if not sha:                        # a peer commit not fetched yet?
+        for peer in conf.peers.values():
+            scan.fetch(repo, peer)
+        sha = repo.rev(args.commit)
+    if not sha:
+        raise DiasporaError("%s: no such commit, here or on any peer"
+                            % args.commit)
+    disc = D.Discussion(repo)
+    if args.clear:
+        disc.clear(sha)
+        ui.say("Forgot the discussion of %s." % sha[:10])
+        return 0
+    if args.message:
+        disc.add(sha, "you", args.message)
+    if args.ask:
+        peer = next((p for p in conf.peers.values()
+                     if repo.rev(p.ref) and repo.is_ancestor(sha, p.ref)),
+                    None)
+        if peer is None:
+            raise DiasporaError("%s is on no peer branch in %s" % (
+                sha[:10], CONF_NAME))
+        agent = make_agent(repo, conf, ui, args)
+        if not agent.enabled:
+            raise DiasporaError("no agent to ask")
+        ui.say("Asking the agent about %s ..." % sha[:10])
+        try:
+            D.reply(repo, conf, agent, peer, sha, pick_target(repo, conf,
+                                                               args))
+        except (ValueError, RuntimeError) as exc:
+            raise DiasporaError(str(exc))
+        agent_cost(ui, agent)
+    thread = disc.thread(sha) if not args.ask else \
+        D.Discussion(repo).thread(sha)
+    if not thread:
+        ui.say("No discussion of %s yet: `diaspora discuss %s -m \"how\"`."
+               % (sha[:10], args.commit))
+        return 0
+    ui.say(scan.one(repo, sha).subject)
+    ui.say("")
+    ui.say(D.as_text(thread))
+    ui.say("")
+    ui.say("Whenever it is imported, the agent porting it is given this.")
     return 0
 
 
@@ -927,13 +985,17 @@ def build_parser():
                                 "promote what passes")
             p.add_argument("--pick", action="append", metavar="COMMIT",
                            help="take this commit (repeatable); no list")
+            p.add_argument("--merge", action="append", metavar="COMMIT",
+                           help="take this commit and merge it: the agent "
+                                "combines it with our code, best effort, "
+                                "where it does not apply (repeatable)")
             p.add_argument("--strategy", choices=("each", "batch"),
                            help="test every import (each) or all together "
                                 "(batch)")
             p.add_argument("--no-promote", action="store_true",
                            help="leave the result on the import branch")
         else:
-            p.set_defaults(yes=False, pick=None, strategy=None,
+            p.set_defaults(yes=False, pick=None, merge=None, strategy=None,
                            no_promote=False)
 
     p = sub.add_parser("import", help="list what peers have for us, pick, "
@@ -979,6 +1041,20 @@ def build_parser():
     p.add_argument("commit")
     p.add_argument("--diff", action="store_true", help="with the full diff")
     p.set_defaults(func=cmd_show)
+    p = sub.add_parser("discuss", help="say how a commit should be "
+                       "imported; the agent can answer")
+    p.add_argument("commit")
+    p.add_argument("-m", "--message", metavar="TEXT",
+                   help="what to say (how to take it, what to leave out, a "
+                        "question)")
+    p.add_argument("--ask", action="store_true",
+                   help="have the agent answer: how it would do it")
+    p.add_argument("--clear", action="store_true",
+                   help="forget the discussion")
+    p.add_argument("--no-agent", action="store_true")
+    p.add_argument("--target", metavar="BRANCH")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.set_defaults(func=cmd_discuss, here=False)
 
     for name, func, text in (
             ("continue", cmd_continue, "go on after resolving a conflict"),

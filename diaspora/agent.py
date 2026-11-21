@@ -6,7 +6,7 @@ Two protocols:
   claude  `claude -p` (Claude Code, headless).  The prompt goes in on
           stdin; the answer comes back as JSON checked against a schema.
   plain   any other command.  It is run as `<command> <mode>` (mode is
-          triage, port or fix) in the directory to work in, gets the
+          triage, discuss, port or fix) in the directory to work in, gets the
           prompt on stdin and the JSON schema in $DIASPORA_SCHEMA, and
           must print one JSON object on stdout.
 """
@@ -55,7 +55,7 @@ class Agent:
         model = conf.triage_model if mode == "triage" else conf.model
         if model:
             cmd += ["--model", model]
-        if mode == "triage":
+        if mode in ("triage", "discuss"):         # reading only
             cmd += conf.triage_args if conf.triage_args is not None else \
                 ["--allowedTools"] + TRIAGE_TOOLS
         else:

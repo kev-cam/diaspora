@@ -71,6 +71,22 @@ A candidate: message, files, triage, verdict and earlier attempts
 .RB ( \-\-diff
 for the diff).
 .TP
+.BI discuss " commit"
+Say how a commit should be imported
+.RB ( \-m
+.IR text :
+what to take, what to adapt, what to leave out, or a question);
+.B \-\-ask
+has the agent answer how it would do it (reading only);
+.B \-\-clear
+forgets the discussion.
+Without options, prints it.
+Whenever the commit is imported, by any route, the agent porting or
+repairing it is given the discussion, and looks the import over against
+it even when the cherry\-pick applied cleanly.
+Kept in
+.IR .git/diaspora/discussion.json .
+.TP
 .BR continue ", " skip ", " abort
 For a run that stopped (a conflict, a failing baseline): go on after
 resolving it, leave the waiting commit out, or drop the run.
@@ -100,8 +116,8 @@ gives the reason.
 Run test levels on the target branch in the workspace.
 .TP
 .BR gui " [" \fIpeer\fR ...]
-The pick list and the run in a browser page on 127.0.0.1: accept, reject,
-defer, retry, auto\-import.
+The pick list and the run in a browser page on 127.0.0.1: accept, retry,
+merge, discuss, reject, defer, auto\-import.
 .TP
 .B fetch
 Fetch the peer branches into
@@ -175,6 +191,14 @@ Do not ask: take the suggested commits and promote what passes.
 .TP
 .BI \-\-pick " commit"
 Take this commit (repeatable); no list.
+.TP
+.BI \-\-merge " commit"
+Take this commit and merge it (repeatable): where it does not apply, the
+agent combines it with our code instead of porting its intent, keeping
+what both sides do; the conflicts show the common ancestor.
+Best effort: what cannot be combined is left out, and the ledger note
+says so.
+The tests still decide; a merge gets at least three repair attempts.
 .TP
 .BR \-\-strategy " " each | batch
 Test each import on its own, or all together.
@@ -356,9 +380,9 @@ and the agent to use.
 .I .git/diaspora/
 The run in progress
 .RI ( session.json ),
-the triage cache, agent prompts and answers, the
-.B auto
-lock.
+the triage cache, discussions
+.RI ( discussion.json ),
+agent prompts and answers, the locks.
 .TP
 .I ~/.cache/diaspora/<repo>\-<hash>/
 The workspace
