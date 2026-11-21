@@ -29,11 +29,12 @@ import webbrowser
 
 from . import ledger as L
 from . import tried as T
-from .config import Config
+from .config import KINDS, LOCAL_NAME, Config
 from .gitutil import DiasporaError, Repo
 from .session import Session, record
 from .ui import UI
 from .userconf import UserConf
+from .workspace import Tester, Workspace, fmt_secs
 
 MARKS = ("accept", "reject", "defer", "retry")
 
@@ -343,6 +344,117 @@ class App:
             return None
         return where
 
+    def tests_text(self):
+        """What an import must pass here, as the testing will run it."""
+        conf = self.conf()
+        target = self.target(conf)
+        notes = conf.comments()
+        out = ["What an import must pass before it can go to %s" % target,
+               "(from %s%s)" % (conf.path, " and %s" % LOCAL_NAME
+                                if os.path.exists(os.path.join(
+                                    self.repo.top, LOCAL_NAME)) else ""),
+               ""]
+        if not conf.tests:
+            out.append("No [test] levels: imports are not tested.")
+            return {"text": "\n".join(out)}
+
+        # which levels, for which peer and kind
+        out.append("Required")
+        chains = []
+        for peer in conf.peers.values():
+            groups = collections.OrderedDict()
+            for kind in KINDS:
+                if kind in peer.ignore:
+                    continue
+                levels = tuple(conf.chain(conf.levels_for(peer.name, kind)))
+                groups.setdefault(levels, []).append(kind)
+            for levels, kinds in groups.items():
+                which = ("every import" if len(groups) == 1 else
+                         "imports of kind %s" % ", ".join(kinds))
+                out.append("  %s from %s: %s" % (
+                    which, peer.name, " -> ".join(levels) or "no testing"))
+                if levels not in chains:
+                    chains.append(levels)
+        if not conf.peers:
+            chains.append(tuple(conf.chain(conf.levels_for("", "bugfix"))))
+        out.append("  (a level's `needs` run first; each level runs only "
+                   "once the one before it passed)")
+        out.append("")
+
+        ws = Workspace(self.repo, conf)
+        out.append("Where")
+        if ws.inplace:
+            out.append("  in this checkout ($DIASPORA_SRC = %s), which must "
+                       "be clean" % ws.path)
+        else:
+            out.append("  in the import workspace, a worktree of this "
+                       "repository:\n    $DIASPORA_SRC   = %s" % ws.path)
+        if ws.build:
+            out.append("    $DIASPORA_BUILD = %s (kept between runs)"
+                       % ws.build)
+        out.append("  %s" % (
+            "each imported commit is tested on its own"
+            if conf.strategy == "each" else
+            "the imports are tested together, and one by one only if "
+            "that fails"))
+        out.append("")
+
+        def secs(value):
+            return re.sub(r"(\d)h00m$", r"\1h", fmt_secs(value))
+
+        tester = Tester(conf, ws, None, lambda *a, **k: None)
+        used = [name for name in conf.tests
+                if any(name in levels for levels in chains)]
+        unused = [name for name in conf.tests if name not in used]
+        for n, name in enumerate(used, 1):
+            level = conf.tests[name]
+            out.append("%d. %s%s" % (n, name, "  (needs %s)" % ", ".join(
+                level.needs) if level.needs else ""))
+            note = notes.get(("test", name))
+            if note:
+                out.extend("   # " + line if line else "   #"
+                           for line in note.splitlines())
+            out.append("   runs:")
+            out.extend("     $ " + run for run in level.runs or [level.run])
+            if level.compares:
+                out.append(
+                    "   passes when no test fails that did not already fail "
+                    "on %s before the import (the command lists the "
+                    "failing tests in $DIASPORA_FAILURES)" % target)
+                ref = None
+                try:
+                    if os.path.isdir(ws.path):
+                        ref = tester.load(target, name)
+                except DiasporaError:
+                    pass
+                out.append(
+                    "   reference for %s: %s" % (target, (
+                        "measured, %d test%s listed as failing there" % (
+                            len(ref), "" if len(ref) == 1 else "s"))
+                        if ref is not None else
+                        "none current; the next run measures it first") +
+                    (" (good for %s)" % secs(level.reference_age)
+                     if level.reference_age else ""))
+            else:
+                out.append("   passes when every command exits 0")
+            extra = ["time limit %s" % secs(level.timeout)
+                     if level.timeout else "no time limit"]
+            if level.retry:
+                extra.append("a failure is run %d more time%s before it "
+                             "counts" % (level.retry,
+                                         "" if level.retry == 1 else "s"))
+            out.append("   " + "; ".join(extra))
+            out.append("")
+        if unused:
+            out.append("Defined but not required: %s" % ", ".join(unused))
+        note = notes.get(("require", ""))
+        if note:
+            if unused:
+                out.append("")
+            out.extend("# " + line if line else "#"
+                       for line in note.splitlines())
+        return {"text": "\n".join(out).rstrip() + "\n"}
+
     def run_log(self, sha):
         session = self.session()
         if not session.exists():
@@ -442,6 +554,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if url.path == "/api/state":
                 since = int((query.get("since") or ["0"])[0])
                 return self._json(200, self.app.state(since))
+            if url.path == "/api/tests":
+                return self._json(200, self.app.tests_text())
             if url.path == "/api/runlog":
                 return self._json(200, self.app.run_log(
                     (query.get("commit") or [""])[0]))
@@ -783,6 +897,9 @@ function help(what, el) {
   const tgt = `<b>${esc(S.target || "the target branch")}</b>`;
   const later = `<p>Nothing happens until you press <b>Apply</b>; press again to unmark.</p>`;
   const tip = {
+    gate: `<p>The test levels an import must pass before it can go to ${tgt},
+      in the order they run.</p><p>Click to see each level's commands, what
+      counts as passing, and where they run.</p>`,
     accept: `<p><b>Import it.</b> Apply cherry-picks it onto a test branch in
       diaspora's own workspace (~/.cache/diaspora), not onto ${tgt}. If it does
       not apply cleanly the agent ports it.</p>
@@ -1012,8 +1129,8 @@ function renderAll() {
     return;
   }
   $("where").innerHTML = `<code>${esc(S.repo)}</code> → <code>${esc(S.target)}</code> at ${
-    esc(S.head)} · peers ${S.peers.map(p => esc(p.name)).join(", ")} · gate: ${
-    esc(S.tests.join(" → ") || "none")}${S.strategy === "batch" ? " (batch)" : ""}`;
+    esc(S.head)} · peers ${S.peers.map(p => esc(p.name)).join(", ")} · gate: <a href="#" id="gatelink" data-tip="gate">${
+    esc(S.tests.join(" → ") || "none")}${S.strategy === "batch" ? " (batch)" : ""}</a>`;
   const sel = $("peer");
   if (sel.options.length !== S.peers.length + 1)
     sel.innerHTML = '<option value="">all</option>' +
@@ -1111,6 +1228,18 @@ async function showRunLog(sha) {
   try { $("dlgtext").textContent = (await api("/api/runlog?commit=" + sha)).text; }
   catch (e) { $("dlgtext").textContent = e.message; }
 }
+async function showTests() {
+  shown = null;
+  $("dlgt").textContent = "testing an import must pass";
+  $("dlgdiff").hidden = true;
+  $("dlgtext").textContent = "loading …";
+  if (!$("dlg").open) $("dlg").showModal();
+  try { $("dlgtext").textContent = (await api("/api/tests")).text; }
+  catch (e) { $("dlgtext").textContent = e.message; }
+}
+$("where").onclick = e => {
+  if (e.target.closest("#gatelink")) { e.preventDefault(); showTests(); }
+};
 $("fetch").onclick = () => act("/api/scan", {fetch: true});
 $("rescan").onclick = () => act("/api/scan", {fetch: false});
 $("apply").onclick = () => act("/api/apply", {});

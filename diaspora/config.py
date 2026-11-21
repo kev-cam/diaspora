@@ -92,6 +92,7 @@ class TestLevel:
     # passes when none fails that did not already fail before the import.
     mode: str = "exit"
     reference_age: float = 86400.0   # how long a measured reference is good
+    runs: list = field(default_factory=list)   # the run lines, as written
 
     @property
     def compares(self):
@@ -217,6 +218,33 @@ class Config:
             entries = [e for e in entries if e[:3] not in keys] + mine
         return cls(repo, entries, path)
 
+    def comments(self):
+        """{(section, sub): the comment lines just above its header}.
+
+        From diaspora.conf, then diaspora.local.conf (whose comment wins).
+        Only comments that touch the header, with no blank line between.
+        """
+        out = {}
+        for path in (self.path, os.path.join(os.path.dirname(self.path),
+                                             LOCAL_NAME)):
+            try:
+                with open(path, encoding="utf-8") as handle:
+                    lines = handle.read().splitlines()
+            except OSError:
+                continue
+            block = []
+            for line in lines:
+                text = line.strip()
+                if text[:1] in ("#", ";"):
+                    block.append(text[1:].strip())
+                    continue
+                m = _SECTION.match(text)
+                if m and block:
+                    out[(m.group(1).lower(), m.group(2) or "")] = \
+                        "\n".join(block)
+                block = []
+        return out
+
     # -- raw access ---------------------------------------------------------
     def _values(self, section, sub, key):
         return self._sec.get((section, sub), {}).get(key, [])
@@ -295,6 +323,7 @@ class Config:
                 timeout=parse_duration(timeout, "test.%s.timeout" % name)
                 if timeout else None,
                 retry=int(one("test", name, "retry", "0")), mode=mode,
+                runs=list(runs),
                 reference_age=parse_duration(
                     one("test", name, "reference-age", "1d"),
                     "test.%s.reference-age" % name))

@@ -516,6 +516,13 @@ one can be marked:
 | Reject | records `rejected` (with the reason you give): never suggested again |
 | Defer | records `deferred`: hidden until "show ignored and deferred" |
 
+The gate in the page's header (`compile → full-regression`, say) is a
+link: it shows what an import must pass, for each peer and kind of change,
+and for each test level its commands, the comment above it in
+`diaspora.conf`, what counts as passing, its time limit and retries,
+whether a reference is measured for the target yet, and where the commands
+run (`$DIASPORA_SRC`, `$DIASPORA_BUILD`).
+
 Apply records the rejections and deferrals and starts one import run with
 the accepted commits; its output scrolls under Output. The run is left on
 its branch, and the page shows what passed and what failed: **Accept:

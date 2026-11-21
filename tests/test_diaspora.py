@@ -1127,6 +1127,27 @@ class GuiTests(World):
                             token="")
         self.assertEqual(code, 403)
 
+    def test_what_is_tested(self):
+        with open(os.path.join(self.ours, "diaspora.conf"), "a") as handle:
+            handle.write("# What the import's own suite says.\n"
+                         '[test "suite"]\n\tneeds = compile\n'
+                         "\trun = echo one\n\trun = echo two\n"
+                         "\tpass = no-new-failures\n\tretry = 1\n"
+                         "\ttimeout = 2h\n"
+                         '[require "up"]\n\tperf = suite\n')
+        code, out = self.call("/api/tests")
+        self.assertEqual(code, 200, out)
+        text = out["text"]
+        self.assertIn("imports of kind perf from up: compile -> suite", text)
+        self.assertIn("from up: compile -> regress", text)
+        self.assertIn("# What the import's own suite says.", text)
+        self.assertIn("$ echo one\n     $ echo two", text)
+        self.assertIn("did not already fail on main", text)
+        self.assertIn("next run measures it first", text)
+        self.assertIn("time limit 2h; a failure is run 1 more time", text)
+        self.assertIn("$DIASPORA_BUILD", text)
+        self.assertIn('id="gatelink"', self.call("/")[1])
+
     def test_accept_reject_defer_then_promote(self):
         state = self.state()
         shas = {c["commit"] for c in state["commits"]}
