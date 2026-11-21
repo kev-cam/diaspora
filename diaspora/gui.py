@@ -758,6 +758,11 @@ section.run h2 { font-size: 15px; margin: 0 0 8px; }
 .run .choice { font-family: system-ui, sans-serif; margin: 3px 0 6px 11ch; color: var(--dim); }
 .run .choice select { font: inherit; color: var(--ink); background: var(--panel);
   border: 1px solid var(--line); border-radius: 6px; padding: 1px 4px; }
+.run .choice select.ch-failed { background: var(--warn); color: var(--on-ink); border-color: var(--warn); }
+.run .choice select.ch-reject { background: var(--bad); color: var(--on-ink); border-color: var(--bad); }
+.run .choice select.ch-defer { background: var(--defer); color: var(--on-ink); border-color: var(--defer); }
+.run .choice select.ch-include { background: var(--ok); color: var(--on-ink); border-color: var(--ok); }
+.run .choice option { color: var(--ink); background: var(--panel); }
 .run .actions { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap;
   align-items: center; }
 table { width: 100%; border-collapse: collapse; background: var(--panel);
@@ -1192,7 +1197,7 @@ function renderRun() {
     if (R.stage !== "ready" || i.state !== "failed") return "";
     const opt = (v, t, off) => `<option value="${v}" ${i.choice === v ? "selected" : ""} ${off ? "disabled" : ""}>${t}</option>`;
     return `<div class="choice">on promote:
-      <select data-choose="${i.sha}" data-tip="choice" ${dis}>
+      <select data-choose="${i.sha}" data-tip="choice" class="ch-${esc(i.choice || "failed")}" ${dis}>
         ${opt("failed", "leave it out, offer it again later (Retry)")}
         ${opt("reject", "leave it out and reject it")}
         ${opt("defer", "leave it out and defer it")}
@@ -1337,8 +1342,10 @@ document.addEventListener("click", ev => {
 });
 document.addEventListener("change", ev => {
   const s = ev.target;
-  if (s.dataset && s.dataset.choose)
+  if (s.dataset && s.dataset.choose) {
+    s.className = "ch-" + s.value;     // show the choice at once, before the poll
     act("/api/choose", {commit: s.dataset.choose, choice: s.value});
+  }
 });
 async function showRunLog(sha) {
   const i = S.run.items.find(x => x.sha === sha);
