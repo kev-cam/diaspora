@@ -44,6 +44,9 @@ make link PREFIX=~/.local   # or a symlink to this checkout
 make check                  # the tests
 ```
 
+Both install the man page too (`man diaspora`; `MANDIR=...` to put it
+elsewhere than `$(PREFIX)/share/man`).
+
 The agent is [Claude Code](https://claude.com/claude-code) run headless
 (`claude -p`); any other command can stand in for it (see [The
 agent](#the-agent)). Without an agent diaspora still works: it classifies
@@ -448,7 +451,7 @@ has been offered so it is not offered twice.
 | | |
 |---|---|
 | `diaspora` / `diaspora import [peer...]` | list, pick, import, test, promote |
-| `diaspora auto [peer...]` | propose a staged import plan, carry it out if you agree (below) |
+| `diaspora auto [peer...]` | propose a staged import plan, carry it out if you agree; `--cron` for cron (below) |
 | `diaspora list [peer...]` | list only; `--json`, `--all`, `--max N` |
 | `diaspora export <peer>` | prepare a branch of our commits for a peer |
 | `diaspora status` | peers, ledger counts, the run in progress |
@@ -501,6 +504,47 @@ job, stage by stage, and the run panel shows the stage in progress. The
 page carries out only the plan it showed: if the candidates changed in the
 meantime it says so and asks you to look again.
 
+Only one `diaspora auto` (or the page's Carry out) runs at a time in a
+repository: a second one says so and stops.
+
+### From cron: `diaspora auto --cron`
+
+`--cron` is `--yes` made for cron, which mails whatever a job prints:
+
+- nothing to import: it prints nothing;
+- a plan carried out: one line per planned commit with what became of it,
+  the range now on the target, where the plan stopped and why, and the log;
+- a run waiting for a person (a conflict, a failing baseline, a run that
+  was interrupted): it imports nothing and says so, every time, until the
+  run is finished (exit 3);
+- the previous `diaspora auto` in that repository still going (a full
+  regression takes hours), or another run at work there (from the page,
+  say): it exits quietly;
+- an error: on stderr, with the log (exit 1).
+
+```
+diaspora auto: VACASK master: 7 of 9 planned commits imported (21ade86c4e..9f03b1d7aa).
+  applied  79eea5c015 arpad    Fix ...
+  adapted  b83841c4ed arpad    ...
+  failed   7c38094790 arpad    ...
+Log: /home/me/.cache/diaspora/VACASK-1a2b3c4d/auto/20261121-013000.log
+```
+
+The scan, the plan, each stage and the test and agent output go to the
+log (`--log FILE`, else a new file under
+`~/.cache/diaspora/<repo>-<hash>/auto/`, the last 30 kept). cron starts
+jobs with almost no environment, and the test levels need what they get
+on your terminal (their tools on `PATH`, variables such as
+`VAMOS_VACASK_HOME`), and the agent must be logged in for that user: run
+it through a script that sets these up.
+[`examples/cron/`](examples/cron) has one, `diaspora-cron REPO...`, and
+a crontab that uses it:
+
+```
+MAILTO=me@example.org
+30 1 * * *  $HOME/bin/diaspora-cron VACASK xyce
+```
+
 ## Your repositories: `~/.config/diaspora`
 
 List the repositories diaspora looks after in `~/.config/diaspora` (same
@@ -514,7 +558,8 @@ syntax as `diaspora.conf`):
 ```
 
 Then `diaspora -C xyce status` works from anywhere, `diaspora repos` lists
-them (with any run in progress), and diaspora started outside a repository,
+them (with any run in progress: running, waiting at a conflict, stopped,
+ready to promote), and diaspora started outside a repository,
 or in one without a `diaspora.conf`, asks which of them to work on (on a
 terminal; otherwise it says to use `-C`). `diaspora gui` started that way
 offers the list on the page, and its header switches between them.
@@ -587,6 +632,7 @@ can drive it.
 
 ## Running unattended
 
+`diaspora auto --cron` is the one for cron ([above](#from-cron-diaspora-auto---cron)).
 `diaspora import --yes --no-promote` takes the suggested commits and leaves
 the tested result on its `diaspora/import/*` branch for a person to look
 at; `--yes` alone also promotes. Things to know for scheduled or cloud

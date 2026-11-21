@@ -11,6 +11,7 @@ when the run is aborted).  The state of a run lives in
 picked up again with `diaspora continue`.
 """
 
+import fcntl
 import json
 import os
 import re
@@ -119,6 +120,44 @@ class Blocked(Exception):
     """The tests fail without the import: nothing can be validated."""
 
 
+class RunLock:
+    """Held by the process working on the run, for as long as it works.
+
+    A run whose stage says "running" may be at work, or may have stopped
+    (a conflict, a failing baseline, a process that died); only this lock
+    tells them apart, and it goes when its process does.
+    """
+
+    def __init__(self, repo):
+        self.path = os.path.join(repo.state_dir(), "run.lock")
+        self.handle = None
+
+    def take(self, shared=False):
+        handle = open(self.path, "a", encoding="utf-8")
+        try:
+            fcntl.flock(handle, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+                        | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            return False
+        self.handle = handle
+        return True
+
+    def release(self):
+        if self.handle:
+            self.handle.close()
+            self.handle = None
+
+
+def run_busy(repo):
+    """Is a process working on the run in progress right now?"""
+    lock = RunLock(repo)
+    if lock.take(shared=True):
+        lock.release()
+        return False
+    return True
+
+
 class Session:
     def __init__(self, repo, conf, ui, agent, interactive=True,
                  assume_yes=False, verbose=False):
@@ -203,6 +242,16 @@ class Session:
 
     # -- the loop ---------------------------------------------------------------
     def run(self):
+        lock = RunLock(self.repo)
+        if not lock.take():
+            raise DiasporaError("another diaspora process is working on this "
+                                "run right now")
+        try:
+            return self._run()
+        finally:
+            lock.release()
+
+    def _run(self):
         items = self.data["items"]
         each = self.conf.strategy == "each"
         try:

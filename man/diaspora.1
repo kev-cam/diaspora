@@ -1,0 +1,442 @@
+.\" SPDX-License-Identifier: GPL-3.0-or-later
+.TH DIASPORA 1 2026-11-21 "diaspora 0.1" "User Commands"
+.nh
+.SH NAME
+diaspora \- bring fixes over from peer repositories, picked, ported and tested
+.SH SYNOPSIS
+.B diaspora
+.RB [ \-C
+.IR dir ]
+.RI [ command ]
+.RI [ options ]
+.RI [ peer ...]
+.PP
+.B diaspora auto
+.RB [ \-\-yes | \-\-dry\-run | \-\-cron ]
+.RB [ \-\-stage\-size
+.IR n ]
+.RB [ \-\-review ]
+.RI [ peer ...]
+.SH DESCRIPTION
+.B diaspora
+treats every repository that shares history with yours as a
+.IR peer .
+It lists the commits a peer has that you do not, sorts them by kind
+(bugfix, feature, docs, ...), with an AI agent's opinion where the commit
+message is not enough, and imports the ones you pick, one by one: each is
+cherry\-picked on an import branch in a separate worktree, ported by the
+agent where it does not apply, tested at the levels
+.I diaspora.conf
+requires for its kind, and, if it passes, copied to your target branch
+with a
+.B Diaspora\-Origin:
+trailer.
+Verdicts go into
+.IR diaspora.ledger ,
+and what was tried and did not work into
+.IR diaspora.log ,
+both committed next to
+.IR diaspora.conf .
+.PP
+Nothing reaches the target branch untested, and diaspora never pushes.
+.PP
+With no command,
+.B import
+is run.
+.SH COMMANDS
+.TP
+.BR import " [" \fIpeer\fR ...]
+Fetch, scan and list what the peers have for us; pick on the terminal;
+import, test and promote what passes.
+.TP
+.BR auto " [" \fIpeer\fR ...]
+Propose a staged import plan and carry it out once agreed; see
+.B AUTO\-IMPORT
+below.
+.TP
+.BR list " [" \fIpeer\fR ...]
+List the candidates and stop
+.RB ( \-\-json
+for a program).
+.TP
+.BI export " peer"
+Put our commits that the peer lacks, and that we are willing to offer, on
+a branch based on the peer's, ready to push for a pull request.
+.TP
+.B status
+Peers, ledger counts and the run in progress.
+.TP
+.BI show " commit"
+A candidate: message, files, triage, verdict and earlier attempts
+.RB ( \-\-diff
+for the diff).
+.TP
+.BR continue ", " skip ", " abort
+For a run that stopped (a conflict, a failing baseline): go on after
+resolving it, leave the waiting commit out, or drop the run.
+.B abort \-\-no\-log
+also drops what would go into
+.IR diaspora.log .
+.TP
+.B promote
+Copy a finished run to the target branch.
+.BI \-\-include " commit"
+takes a commit that failed its tests anyway;
+.BI \-\-reject " commit"
+and
+.BI \-\-defer " commit"
+leave a failed commit out with that verdict instead of
+.IR failed .
+.TP
+.BR reject ", " defer ", " reopen ", " withhold " " \fIcommit\fR ...
+Record a verdict without importing:
+never suggest it again, hide it until
+.BR \-\-all ,
+forget the verdict, never offer this commit of ours to a peer.
+.B \-m
+gives the reason.
+.TP
+.BR test " [" \fIlevel\fR ...]
+Run test levels on the target branch in the workspace.
+.TP
+.BR gui " [" \fIpeer\fR ...]
+The pick list and the run in a browser page on 127.0.0.1: accept, reject,
+defer, retry, auto\-import.
+.TP
+.B fetch
+Fetch the peer branches into
+.IR refs/diaspora/ .
+.TP
+.B log
+Print the ledger.
+.TP
+.B repos
+The repositories listed in
+.IR ~/.config/diaspora ,
+with any run in progress.
+.TP
+.B init
+Write a starting
+.I diaspora.conf
+from the repository's remotes.
+.SH OPTIONS
+.TP
+.BI \-C " dir"
+Run as if started in
+.IR dir ,
+or in the repository of that name in
+.IR ~/.config/diaspora .
+.PP
+For
+.BR import ,
+.BR auto ,
+.B list
+and
+.BR export :
+.TP
+.B \-\-no\-fetch
+Use the peer branches as last fetched.
+.TP
+.B \-\-no\-agent
+No AI agent: classify from commit messages only; a conflict stops the run
+.RB ( import )
+or fails the commit
+.RB ( auto ).
+.TP
+.BI \-\-target " branch"
+The branch to import into (default: the
+.B target
+in
+.IR diaspora.conf ,
+else the current branch).
+.B \-\-here
+imports into the current branch whatever
+.I diaspora.conf
+says.
+.TP
+.B \-\-all
+Also list ignored and deferred commits.
+.TP
+.BI \-\-max " n"
+List at most
+.I n
+commits (0: no limit; default 50).
+.TP
+.BR \-v ", " \-\-verbose
+Show test and agent output as it runs.
+.PP
+For
+.B import
+and
+.BR export :
+.TP
+.BR \-y ", " \-\-yes
+Do not ask: take the suggested commits and promote what passes.
+.TP
+.BI \-\-pick " commit"
+Take this commit (repeatable); no list.
+.TP
+.BR \-\-strategy " " each | batch
+Test each import on its own, or all together.
+.TP
+.B \-\-no\-promote
+Leave the result on its import branch.
+.SH AUTO-IMPORT
+.B diaspora auto
+scans as
+.B import
+does, then proposes a plan instead of a pick list: the commits diaspora
+would suggest anyway, in stages, the safest first:
+.IP 1. 4
+suggested commits that touch none of the files our own commits changed;
+.IP 2. 4
+suggested commits that touch files we changed too, whose overlap is not
+known, or that the agent calls high\-risk;
+.IP 3. 4
+with
+.BR \-\-review ,
+commits listed for review that the agent says to import.
+.PP
+A commit goes no earlier than a commit it needs, and is left out when what
+it needs is.
+Commits that failed before or were tried and did not work are never in a
+plan (they need a Retry, with someone looking), nor are deferred or
+ignored commits, nor commits of a run in progress.
+.PP
+Each stage is an ordinary import run: what passes is promoted to the
+target before the next stage starts; a commit that fails its tests, or
+whose conflict the agent cannot resolve, is left out and offered again.
+The plan stops when a run cannot go on by itself (the tests cannot run, or
+fail on the target without the import); that run then waits for
+.BR "diaspora continue" ,
+.B promote
+or
+.BR abort .
+.TP
+.BR \-y ", " \-\-yes
+Carry the plan out without asking.
+Without it,
+.B auto
+asks on a terminal and only shows the plan otherwise.
+.TP
+.BR \-n ", " \-\-dry\-run
+Show the plan and stop (also while a run is in progress).
+.TP
+.BI \-\-stage\-size " n"
+At most
+.I n
+commits per stage, split evenly (0: no limit; default 8).
+.TP
+.B \-\-review
+Add the third stage.
+.TP
+.B \-\-cron
+Unattended, for
+.BR cron (8);
+implies
+.BR \-\-yes .
+See
+.B RUNNING FROM CRON
+below.
+.TP
+.BI \-\-log " file"
+With
+.BR \-\-cron :
+where the full output goes.
+.PP
+Only one
+.B diaspora auto
+(or the page's Carry out) runs at a time in a repository; a second one
+says so and stops.
+.SH RUNNING FROM CRON
+.B diaspora auto \-\-cron
+is made to be run by
+.BR cron (8),
+which mails whatever a job prints:
+.IP \(bu 2
+When there is nothing to import, it prints nothing.
+.IP \(bu 2
+When it carried out a plan, it prints one line per planned commit with
+what became of it
+.RI ( applied ,
+.IR adapted ,
+.IR failed ,
+.IR superseded ,
+.IR "not run" ),
+the range now on the target, whether the plan stopped and why, and the
+log file.
+.IP \(bu 2
+When a run is waiting for a person (a conflict, a failing baseline, a
+run that was interrupted), it imports nothing and says so, every time,
+until the run is finished.
+.IP \(bu 2
+When the previous
+.B diaspora auto
+in that repository is still going (a full regression can take hours), or
+another run is at work there (started from the page, say), it exits
+quietly.
+.IP \(bu 2
+Errors go to standard error, with the log file.
+.PP
+Everything else (the scan, the plan, each stage, the test and agent
+output) goes to the log: by default a new file in
+.IR ~/.cache/diaspora/<repo>\-<hash>/auto/ ,
+of which the last 30 are kept.
+.PP
+cron starts jobs with almost no environment.
+The test commands in
+.I diaspora.conf
+need what they get on your terminal (their tools on
+.BR PATH ,
+any variables a level relies on), and the agent
+.RB ( claude )
+must be installed and logged in for the user the job runs as.
+A small script that sets these up and then runs diaspora is the easy way;
+.I examples/cron/
+in the diaspora sources has one.
+.SH EXIT STATUS
+.TP
+.B 0
+Done (or nothing to do).
+.TP
+.B 1
+Error; for
+.B auto
+without
+.BR \-\-cron ,
+also a run in progress or another
+.B auto
+running.
+.TP
+.B 3
+Waiting for a person: a conflict, a baseline that fails, a plan that
+stopped at a run.
+.TP
+.B 4
+.RB ( import )
+Some imports failed.
+.TP
+.B 130
+Interrupted.
+.SH ENVIRONMENT
+.TP
+.BR DIASPORA_SRC ", " DIASPORA_BUILD
+Set for test commands: the source tree under test and its build
+directory.
+.TP
+.B DIASPORA_SCHEMA
+Set for the agent: the JSON schema of the answer it must print.
+.TP
+.BR DIASPORA_CONFIG ", " XDG_CONFIG_HOME
+Where the user's list of repositories is.
+.TP
+.B XDG_CACHE_HOME
+Where workspaces and cron logs go (default
+.IR ~/.cache ).
+.TP
+.B NO_COLOR
+No colour on a terminal.
+.SH FILES
+.TP
+.I diaspora.conf
+Peers, policy, test levels and what testing each kind of change requires;
+committed.
+.TP
+.I diaspora.local.conf
+Settings for this machine only; not committed.
+.TP
+.IR diaspora.ledger ", " diaspora.log
+Verdicts, and what was tried and did not work; committed by diaspora.
+.TP
+.I ~/.config/diaspora
+The repositories diaspora looks after
+.RB ( "diaspora \-C" " " \fIname\fR ),
+and the agent to use.
+.TP
+.I .git/diaspora/
+The run in progress
+.RI ( session.json ),
+the triage cache, agent prompts and answers, the
+.B auto
+lock.
+.TP
+.I ~/.cache/diaspora/<repo>\-<hash>/
+The workspace
+.RI ( src ", " build )
+and cron logs
+.RI ( auto/ ).
+.TP
+.IR refs/diaspora/ <peer>/<branch>
+The fetched peer branches.
+.TP
+.IR diaspora/import/ "<time>, " diaspora/export/ <peer>/<time>
+Import and export branches.
+.SH EXAMPLES
+Look at what the peers have, pick and import:
+.PP
+.RS
+.nf
+cd ~/src/nvc
+diaspora
+.fi
+.RE
+.PP
+See the plan for an unattended import, without carrying it out:
+.PP
+.RS
+.nf
+diaspora \-C VACASK auto \-\-dry\-run
+.fi
+.RE
+.PP
+Carry it out, smaller stages, without asking:
+.PP
+.RS
+.nf
+diaspora \-C VACASK auto \-\-yes \-\-stage\-size 4
+.fi
+.RE
+.PP
+Every night at 01:30, through a script that sets up the environment
+first (cron mails only when something was imported, or went wrong):
+.PP
+.RS
+.nf
+MAILTO=me@example.org
+30 1 * * *  $HOME/bin/diaspora\-cron VACASK xyce
+.fi
+.RE
+.PP
+where
+.I diaspora\-cron
+is, at its simplest:
+.PP
+.RS
+.nf
+#!/bin/sh
+\&. "$HOME/.profile"
+for repo in "$@"; do diaspora \-C "$repo" auto \-\-cron; done
+.fi
+.RE
+.PP
+Have an agent session drive an import:
+.PP
+.RS
+.nf
+diaspora list \-\-json
+diaspora import \-\-pick 3cb89e1f0f \-\-no\-agent   # exit 3: conflict
+(resolve it in the workspace, git add)
+diaspora continue
+diaspora promote
+.fi
+.RE
+.SH SEE ALSO
+.BR git (1),
+.BR git\-cherry\-pick (1),
+.BR cron (8),
+.BR crontab (5).
+.PP
+The README in the diaspora sources, https://github.com/kev\-cam/diaspora,
+covers
+.I diaspora.conf
+in full.

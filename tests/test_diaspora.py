@@ -1212,6 +1212,74 @@ class AutoTests(World):
         self.assertIn("A run is in progress",
                       self.run_cli("auto", "--no-agent", "--dry-run", code=0))
 
+    def cron_logs(self):
+        import glob
+        return sorted(glob.glob(os.path.join(
+            self.tmp, "cache", "diaspora", "*", "auto", "*.log")))
+
+    def test_cron_reports_what_it_did(self):
+        out = self.run_cli("auto", "--no-agent", "--cron", code=0)
+        lines = out.splitlines()
+        self.assertRegex(lines[0], r"^diaspora auto: \S+ main: 1 of 3 "
+                         r"planned commits imported \([0-9a-f]{10}\.\."
+                         r"[0-9a-f]{10}\)\.$")
+        self.assertRegex(out, r"applied +%s up +Fix crash in a" % self.p1[:10])
+        self.assertRegex(out, r"failed +%s up " % self.p4[:10])
+        logs = self.cron_logs()
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(lines[-1], "Log: " + logs[0])
+        with open(logs[0], encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertIn("Import plan for main: 3 commits in 2 stages.", text)
+        self.assertIn("== Stage 2 of 2", text)
+        self.assertEqual(self.last_err, "")
+        # the next night: nothing left to import, so nothing to say
+        out = self.run_cli("auto", "--no-agent", "--cron", code=0)
+        self.assertEqual((out, self.last_err), ("", ""))
+        self.assertEqual(len(self.cron_logs()), 2)
+
+    def test_cron_waits_for_a_waiting_run(self):
+        self.commit(self.ours, "Break the regression on purpose", {
+            "src/broken.c": "BREAK\n"})
+        log = os.path.join(self.tmp, "night.log")
+        out = self.run_cli("auto", "--no-agent", "--cron", "--log", log,
+                           code=3)
+        self.assertIn("0 of 3 planned commits imported.", out)
+        self.assertIn("The plan stopped: the run is blocked.", out)
+        self.assertTrue(out.endswith("Log: %s\n" % log))
+        out = self.run_cli("auto", "--no-agent", "--cron", code=3)
+        self.assertRegex(out, r"nothing imported; run \S+ stopped \(blocked, "
+                         r"or interrupted\)\.\nIt needs you: ")
+        self.run_cli("auto", "--cron", "--dry-run", code=1)
+        # a run some process is at (the page, say) is no news
+        from diaspora.session import RunLock
+        lock = RunLock(Repo(self.ours))
+        self.assertTrue(lock.take())
+        try:
+            out = self.run_cli("auto", "--no-agent", "--cron", code=0)
+            self.assertEqual((out, self.last_err), ("", ""))
+            self.assertIn("running", self.run_cli("repos"))
+        finally:
+            lock.release()
+
+    def test_one_auto_at_a_time(self):
+        from diaspora import plan as P
+        tip = git(self.ours, "rev-parse", "main")
+        lock = P.Lock(Repo(self.ours))
+        self.assertTrue(lock.take())
+        try:
+            out = self.run_cli("auto", "--no-agent", "--cron", code=0)
+            self.assertEqual((out, self.last_err), ("", ""))
+            self.run_cli("auto", "--no-agent", "--yes", code=1)
+            self.assertIn("another `diaspora auto` is running", self.last_err)
+            self.assertIn("(pid %d)" % os.getpid(), self.last_err)
+            self.run_cli("auto", "--no-agent", "--dry-run", code=0)
+        finally:
+            lock.release()
+        self.assertEqual(git(self.ours, "rev-parse", "main"), tip)
+        self.run_cli("auto", "--no-agent", "--cron", code=0)
+        self.assertNotEqual(git(self.ours, "rev-parse", "main"), tip)
+
 
 class GuiTests(World):
     """The browser page's server, driven over HTTP as the page drives it."""

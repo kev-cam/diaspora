@@ -19,15 +19,19 @@ from .config import CONF_NAME, LOCAL_NAME
 from .gitutil import DiasporaError
 
 
+def cache_home(repo):
+    """~/.cache/diaspora/<repo>-<hash>: diaspora's own files for a repo."""
+    cache = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    tag = "%s-%s" % (os.path.basename(repo.top), hashlib.sha1(
+        repo.common.encode()).hexdigest()[:8])
+    return os.path.join(cache, "diaspora", tag)
+
+
 class Workspace:
     def __init__(self, repo, conf):
         self.repo = repo
         self.inplace = conf.workspace == "inplace"
-        cache = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser(
-            "~/.cache")
-        tag = "%s-%s" % (os.path.basename(repo.top), hashlib.sha1(
-            repo.common.encode()).hexdigest()[:8])
-        home = os.path.join(cache, "diaspora", tag)
+        home = cache_home(repo)
         if self.inplace:
             self.path = repo.top
         else:

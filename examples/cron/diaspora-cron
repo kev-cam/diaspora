@@ -1,0 +1,38 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# diaspora-cron REPO...: `diaspora auto --cron` in each repository, one after
+# the other, for cron.  REPO is a path, or a name from ~/.config/diaspora.
+#
+# Prints nothing when there was nothing to import, so cron mails only when
+# something was imported, a commit failed, a run is waiting for you, or
+# something went wrong.  Exit status: the worst of the repositories (0 done,
+# 3 waiting, 1 error).
+#
+# cron starts jobs with almost no environment: set up here what the test
+# levels in each diaspora.conf, and the agent, get on your terminal.
+
+# PATH and the like (claude is usually in ~/.local/bin); quietly
+. "$HOME/.profile" >/dev/null 2>&1
+PATH="$HOME/.local/bin:$PATH"
+export PATH
+
+# Variables particular test levels need, e.g. VACASK's mixed-signal level
+# (vamos's tests and the co-simulation demos):
+# export VAMOS_VACASK_HOME=/usr/local/src/VACASK/build
+
+# Not on a terminal: no colour, no pager
+NO_COLOR=1 GIT_PAGER=cat
+export NO_COLOR GIT_PAGER
+
+worst=0
+for repo in "$@"; do
+    diaspora -C "$repo" auto --cron
+    rc=$?
+    case "$rc" in
+        0) ;;
+        3) [ "$worst" -eq 0 ] && worst=3 ;;
+        *) worst=1 ;;
+    esac
+done
+exit "$worst"

@@ -14,7 +14,7 @@ from . import tried as T
 from .agent import Agent
 from .config import CONF_NAME, KINDS, LOCAL_NAME, Config
 from .gitutil import DiasporaError, NotARepo, NotYours, Repo, me
-from .session import Session, record
+from .session import Session, record, run_busy
 from .ui import UI
 from .userconf import UserConf
 from .workspace import Tester, Workspace
@@ -254,9 +254,28 @@ def cmd_import(repo, ui, args, direction="import"):
 
 def cmd_auto(repo, ui, args):
     """Propose a staged import plan; carry it out when agreed."""
+    if args.cron:
+        return auto_cron(repo, args)
+    if args.dry_run:
+        return run_auto(repo, ui, args)["code"]
+    lock = P.Lock(repo)
+    if not lock.take():
+        raise DiasporaError("another `diaspora auto` is running in %s%s"
+                            % (repo.top, " (pid %s)" % lock.holder
+                               if lock.holder else ""))
+    try:
+        return run_auto(repo, ui, args)["code"]
+    finally:
+        lock.release()
+
+
+def run_auto(repo, ui, args):
+    """The work of `diaspora auto`: {code, target, plan, status}."""
     conf = Config.load(repo)
     agent = make_agent(repo, conf, ui, args)
     target = pick_target(repo, conf, args)
+    res = {"code": 0, "target": target, "plan": None, "status": None,
+           "conf": conf, "before": repo.rev(target)}
     running = Session(repo, conf, ui, agent, interactive=False).exists()
     if running and not args.dry_run:
         raise DiasporaError(
@@ -269,8 +288,8 @@ def cmd_auto(repo, ui, args):
     found = gather(repo, conf, ui, agent, pick_peers(conf, args.peers),
                    target, args)
     commits = [c for _peer, got, _dropped in found for c in got]
-    plan = P.propose(repo, conf, target, commits, size=args.stage_size,
-                     review=args.review)
+    plan = res["plan"] = P.propose(repo, conf, target, commits,
+                                   size=args.stage_size, review=args.review)
     ui.say("")
     for line in P.describe(plan):
         ui.say(line)
@@ -280,19 +299,122 @@ def cmd_auto(repo, ui, args):
             ui.say("(A run is in progress: it has to be finished before a "
                    "plan can be carried out.)")
         agent_cost(ui, agent)
-        return 0
+        return res
     if not args.yes:
         if not (sys.stdin.isatty() and sys.stdout.isatty()):
             ui.say("Not a terminal: `diaspora auto --yes` carries it out.")
-            return 0
+            return res
         if not ui.confirm("Carry out this plan?", default=False):
             ui.say("Nothing imported.")
             agent_cost(ui, agent)
-            return 0
+            return res
     status, _done = P.carry_out(repo, conf, ui, agent, plan,
                                 verbose=args.verbose)
+    res["status"] = status
     agent_cost(ui, agent)
-    return 0 if status == "done" else 3
+    res["code"] = 0 if status == "done" else 3
+    return res
+
+
+def auto_cron(repo, args):
+    """`diaspora auto --cron`: unattended, for cron.
+
+    Says nothing when there is nothing to import (so cron sends no mail);
+    otherwise a short summary of what was imported, what failed and where
+    the plan stopped.  Everything else (the scan, the plan, the test
+    output) goes to a log file.
+    """
+    if args.dry_run:
+        raise DiasporaError("--cron carries the plan out; it cannot be a "
+                            "--dry-run")
+    args.yes = True
+    name = os.path.basename(repo.top)
+    lock = P.Lock(repo)
+    if not lock.take():
+        return 0                       # the last run is still going: fine
+    try:
+        if run_busy(repo):
+            return 0                   # a run is at work (the page?): fine
+        state = run_state(repo.top)
+        if state:
+            print("diaspora auto: %s: nothing imported; %s.\nIt needs you: "
+                  "diaspora -C %s status, then continue, promote or abort."
+                  % (name, state, repo.top))
+            return 3
+        log = os.path.abspath(args.log) if args.log else P.cron_log(repo)
+        res, failure = None, None
+        with to_log(log):
+            try:
+                res = run_auto(repo, UI(color=False), args)
+            except DiasporaError as exc:
+                failure = str(exc)
+                print("diaspora: " + failure, file=sys.stderr)
+        if failure:
+            print("diaspora auto: %s: %s\nLog: %s" % (name, failure, log),
+                  file=sys.stderr)
+            return 1
+        plan = res["plan"]
+        if not plan.stages:
+            return 0
+        for line in cron_summary(repo, name, res):
+            print(line)
+        print("Log: %s" % log)
+        return res["code"]
+    finally:
+        lock.release()
+
+
+class to_log:
+    """Send stdout and stderr, ours and our children's, to a file."""
+
+    def __init__(self, path):
+        self.path = path
+
+    def __enter__(self):
+        sys.stdout.flush()
+        sys.stderr.flush()
+        self.handle = open(self.path, "a", encoding="utf-8")
+        self.saved = (sys.stdout, sys.stderr)
+        self.fds = []
+        for fd in (1, 2):
+            try:
+                self.fds.append((fd, os.dup(fd)))
+                os.dup2(self.handle.fileno(), fd)
+            except OSError:
+                pass
+        sys.stdout = sys.stderr = self.handle
+        return self
+
+    def __exit__(self, *exc):
+        self.handle.flush()
+        sys.stdout, sys.stderr = self.saved
+        for fd, copy in self.fds:
+            os.dup2(copy, fd)
+            os.close(copy)
+        self.handle.close()
+
+
+def cron_summary(repo, name, res):
+    """The lines an unattended run reports."""
+    plan, status = res["plan"], res["status"]
+    became = P.outcome(repo, res["conf"], plan)
+    imported = [c for c in plan.commits
+                if became[c.sha] in (L.APPLIED, L.ADAPTED)]
+    after = repo.rev(plan.target)
+    out = ["diaspora auto: %s %s: %d of %d planned commit%s imported%s." % (
+        name, plan.target, len(imported), len(plan.commits),
+        "" if len(plan.commits) == 1 else "s",
+        " (%s..%s)" % (res["before"][:10], after[:10])
+        if after and res["before"] and after != res["before"] else "")]
+    width = max(len(v) for v in became.values())
+    for c in plan.commits:
+        out.append("  %-*s  %s %-8s %s" % (width, became[c.sha], c.short,
+                                          c.peer, c.subject[:60]))
+    if status != "done":
+        out.append("The plan stopped: the run is %s.  Finish it: diaspora "
+                   "-C %s status, then continue, promote or abort."
+                   % (status, repo.top))
+    return out
 
 
 def cmd_export(repo, ui, args):
@@ -502,7 +624,22 @@ def run_state(where):
             data = json.load(handle)
     except (DiasporaError, OSError, ValueError):
         return ""
-    return "run %s %s" % (data.get("id", "?"), data.get("stage", "?"))
+    return "run %s %s" % (data.get("id", "?"), run_word(repo, data))
+
+
+def run_word(repo, data):
+    """running (a process is at it), waiting (for a person), ready, ..."""
+    stage = data.get("stage", "?")
+    if stage == "running":
+        if run_busy(repo):
+            return "running"
+        items = data.get("items") or []
+        if any(i.get("state") == "paused" for i in items):
+            return "waiting at a conflict"
+        return "stopped (blocked, or interrupted)"
+    if stage == "ready":
+        return "ready to promote"
+    return stage
 
 
 def cmd_repos(repo, ui, args):
@@ -535,8 +672,9 @@ NO_REPO = ("repos", "gui")
 READ_ONLY = ("repos", "status", "show", "log")
 
 
-def note_added(user, added):
-    if added:                         # (not on stdout: --json)
+def note_added(user, added, args=None):
+    # (not on stdout: --json; not at all for cron, which mails any output)
+    if added and not getattr(args, "cron", False):
         print('(added %s to %s as "%s")' % (user.repos[added], user.source,
                                             added), file=sys.stderr)
 
@@ -558,7 +696,7 @@ def open_repo(args, ui):
         repo = Repo(where)
     except NotYours as exc:
         # listed all the same: it may be shared with this user later
-        note_added(user, user.remember(exc.top))
+        note_added(user, user.remember(exc.top), args)
         raise
     except NotARepo:
         if named or not user.repos:
@@ -572,7 +710,7 @@ def open_repo(args, ui):
         repo = None
     if repo is not None and (named or args.cmd == "init" or os.path.isfile(
             os.path.join(repo.top, CONF_NAME)) or not user.repos):
-        note_added(user, user.remember(repo))
+        note_added(user, user.remember(repo), args)
         if args.cmd not in READ_ONLY:
             repo.check_writable()
         return repo
@@ -815,6 +953,15 @@ def build_parser():
     p.add_argument("--review", action="store_true",
                    help="also plan commits listed for review that the "
                         "agent says to import")
+    p.add_argument("--cron", action="store_true",
+                   help="unattended (implies --yes): silent when there is "
+                        "nothing to import, else a short summary; the full "
+                        "output goes to a log; skips the night if the last "
+                        "run is still going")
+    p.add_argument("--log", metavar="FILE",
+                   help="with --cron: the log file (default: a new one in "
+                        "~/.cache/diaspora/<repo>-<hash>/auto/, the last "
+                        "%d kept)" % P.KEEP_LOGS)
     p.set_defaults(func=cmd_auto)
     p = sub.add_parser("list", help="list candidate imports and stop")
     scanning(p, picks=False)

@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Unattended imports with diaspora: add with `crontab -e`, after copying
+# diaspora-cron (next to this file) to ~/bin and editing what it exports.
+#
+# cron mails what a job prints.  `diaspora auto --cron` prints nothing when
+# there is nothing to import; otherwise one line per planned commit (applied,
+# adapted, failed, ...), whether the plan stopped and why, and its log file
+# (the full output, in ~/.cache/diaspora/<repo>-<hash>/auto/).
+MAILTO=me@example.org
+
+# m  h  dom mon dow  command
+# Every night at 01:30: VACASK, then xyce (one at a time: each runs its full
+# regression for every stage).
+30 1 * * *  $HOME/bin/diaspora-cron VACASK xyce
+
+# The repositories with the long regressions, on Saturday mornings.
+0 6 * * 6   $HOME/bin/diaspora-cron nvc iverilog
+
+# A single repository, without the script (when the tests need nothing from
+# your login environment), and smaller stages:
+# 30 2 * * *  cd /usr/local/src/VACASK && /usr/local/bin/diaspora auto --cron --stage-size 4
+
+# Only show the plan each Monday (cron mails it), import nothing:
+# 0 8 * * 1  /usr/local/bin/diaspora -C VACASK auto --dry-run --no-fetch

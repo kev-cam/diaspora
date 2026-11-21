@@ -24,15 +24,18 @@ to look at them (Retry), so they are never in a plan; nor are deferred,
 ignored or not-applicable ones.
 """
 
+import fcntl
 import json
 import os
 import textwrap
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
 from . import ledger as L
 from . import tried as T
 from .session import Session
+from .workspace import cache_home
 
 SAFE, OURS, REVIEW = "safe", "ours", "review"
 TITLES = {
@@ -95,6 +98,78 @@ def in_run(repo):
             return {i["sha"] for i in json.load(handle)["items"]}
     except (OSError, ValueError, KeyError, TypeError):
         return set()
+
+
+class Lock:
+    """One `diaspora auto` at a time in a repository, held until it ends.
+
+    A run only shows (session.json) once the scan is over, which can take
+    minutes; without the lock two nightly runs could both start.
+    """
+
+    def __init__(self, repo):
+        self.path = os.path.join(repo.state_dir(), "auto.lock")
+        self.handle = None
+        self.holder = ""
+
+    def take(self):
+        handle = open(self.path, "a+", encoding="utf-8")
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.seek(0)
+            self.holder = handle.read().strip()
+            handle.close()
+            return False
+        handle.seek(0)
+        handle.truncate()
+        handle.write("%d\n" % os.getpid())
+        handle.flush()
+        self.handle = handle
+        return True
+
+    def release(self):
+        if self.handle:
+            self.handle.close()
+            self.handle = None
+
+    def __enter__(self):
+        return self.take()
+
+    def __exit__(self, *exc):
+        self.release()
+
+
+KEEP_LOGS = 30
+
+
+def cron_log(repo):
+    """A new log file for an unattended run; the oldest beyond KEEP_LOGS go."""
+    where = os.path.join(cache_home(repo), "auto")
+    os.makedirs(where, exist_ok=True)
+    old = sorted(f for f in os.listdir(where) if f.endswith(".log"))
+    for name in old[:max(0, len(old) - KEEP_LOGS + 1)]:
+        try:
+            os.unlink(os.path.join(where, name))
+        except OSError:
+            pass
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(where, stamp + ".log")
+    num = 1
+    while os.path.exists(path):
+        num += 1
+        path = os.path.join(where, "%s-%d.log" % (stamp, num))
+    return path
+
+
+def outcome(repo, conf, plan):
+    """{sha: what became of it} for the plan's commits, from the ledger."""
+    ledger = L.Ledger.at(repo, plan.target, conf.ledger).latest("import")
+    out = {}
+    for c in plan.commits:
+        entry = ledger.get(c.sha) or {}
+        out[c.sha] = entry.get("verdict") or "not run"
+    return out
 
 
 def propose(repo, conf, target, commits, size=8, review=False):

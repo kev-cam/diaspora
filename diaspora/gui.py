@@ -291,11 +291,16 @@ class App:
         def on_stage(num, total, stage):
             self.job["name"] = "auto-import: stage %d of %d" % (num, total)
 
+        lock = P.Lock(self.repo)
+        if not lock.take():
+            raise DiasporaError("`diaspora auto` is running already (pid %s, "
+                                "from cron?)" % (lock.holder or "?"))
         try:
             status, done = P.carry_out(self.repo, conf, self.ui, agent, plan,
                                        verbose=self.args.verbose,
                                        on_stage=on_stage)
         finally:
+            lock.release()
             self.agent_cost += agent.cost
             self.do_scan(fetch=False)
         if status != "done":
