@@ -28,6 +28,7 @@ import urllib.parse
 import webbrowser
 
 from . import ledger as L
+from . import plan as P
 from . import tried as T
 from .config import KINDS, LOCAL_NAME, Config
 from .gitutil import DiasporaError, Repo
@@ -255,6 +256,53 @@ class App:
                 del self.marks[sha]
         self.notes.clear()
         self.do_scan(fetch=False)
+        return status
+
+    def plan(self, review=False, size=8):
+        """The auto-import plan for the commits on the page."""
+        conf = self.conf()
+        target = self.target(conf)
+        plan = P.propose(self.repo, conf, target, self.commits, size=size,
+                         review=review)
+        out = plan.as_dict()
+        out["running"] = Session(self.repo, conf, self.ui,
+                                 types.SimpleNamespace(log_dir=None),
+                                 interactive=False).exists()
+        out["untested"] = not conf.has_requirements()
+        out["scanned"] = bool(self.scanned)
+        return out
+
+    def do_auto(self, review, size, shown):
+        """Carry out the plan the page showed (`shown`: its commits)."""
+        conf = self.conf()
+        target = self.target(conf)
+        if not conf.has_requirements():
+            raise DiasporaError("diaspora.conf requires no testing: an "
+                                "automatic import would land untested")
+        plan = P.propose(self.repo, conf, target, self.commits, size=size,
+                         review=review)
+        if [c.sha for c in plan.commits] != list(shown):
+            raise DiasporaError("the candidates changed since the plan was "
+                                "shown: look at the plan again")
+        if not plan.stages:
+            raise DiasporaError("nothing to import")
+        agent = self.agent(conf)
+
+        def on_stage(num, total, stage):
+            self.job["name"] = "auto-import: stage %d of %d" % (num, total)
+
+        try:
+            status, done = P.carry_out(self.repo, conf, self.ui, agent, plan,
+                                       verbose=self.args.verbose,
+                                       on_stage=on_stage)
+        finally:
+            self.agent_cost += agent.cost
+            self.do_scan(fetch=False)
+        if status != "done":
+            raise DiasporaError(
+                "the plan stopped at stage %d of %d: the run is %s; finish "
+                "it above, then look at the plan again" % (
+                    done + 1, len(plan.stages), status))
         return status
 
     def do_run(self, action, keep_log=True):
@@ -554,6 +602,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if url.path == "/api/state":
                 since = int((query.get("since") or ["0"])[0])
                 return self._json(200, self.app.state(since))
+            if url.path == "/api/plan":
+                return self._json(200, self.app.plan(
+                    (query.get("review") or ["0"])[0] == "1",
+                    int((query.get("size") or ["8"])[0] or 0)))
             if url.path == "/api/tests":
                 return self._json(200, self.app.tests_text())
             if url.path == "/api/runlog":
@@ -596,6 +648,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     raise DiasporaError(
                         "a run is waiting: accept (promote) or drop it first")
                 app.start("import", app.do_apply)
+            elif url.path == "/api/auto":
+                if os.path.exists(app.session_file()):
+                    raise DiasporaError(
+                        "a run is waiting: accept (promote) or drop it first")
+                shown = body.get("commits")
+                if not isinstance(shown, list) or not shown:
+                    raise DiasporaError("no plan to carry out")
+                app.start("auto-import", app.do_auto,
+                          bool(body.get("review")),
+                          int(body.get("size") or 0), shown)
             elif url.path == "/api/choose":
                 app.choose(body.get("commit", ""), body.get("choice", ""))
             elif url.path == "/api/run":
@@ -742,6 +804,17 @@ dialog { border: 1px solid var(--line); border-radius: 10px; background: var(--p
 dialog .head { display: flex; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--line);
   align-items: center; }
 dialog .head .t { flex: 1; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#plandlg .opts { display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
+  padding: 8px 14px; border-bottom: 1px solid var(--line); font-size: 13px; }
+#plandlg .opts input[type=number] { width: 4em; }
+#plantext { padding: 4px 14px 12px; overflow: auto; max-height: calc(88vh - 100px);
+  font-size: 13px; }
+#plantext h3 { font-size: 13.5px; margin: 14px 0 4px; }
+#plantext table { border-radius: 6px; table-layout: fixed; }
+#plantext td:nth-child(1) { width: 7.5em; } #plantext td:nth-child(2) { width: 5.5em; }
+#plantext td { padding: 3px 8px; font-size: 12.5px; }
+#plantext .why { color: var(--dim); }
+#plantext .err { color: var(--bad); }
 dialog pre { margin: 0; padding: 12px 14px; font-family: var(--mono); font-size: 12px;
   white-space: pre-wrap; overflow: auto; max-height: calc(88vh - 56px); }
 .err { color: var(--bad); }
@@ -771,6 +844,7 @@ dialog pre { margin: 0; padding: 12px 14px; font-family: var(--mono); font-size:
   <div class="toolbar">
     <button id="fetch">Fetch and rescan</button>
     <button id="rescan">Rescan</button>
+    <button id="auto" data-tip="auto">Auto-import…</button>
     <label><input type="checkbox" id="showall"> show ignored and deferred</label>
     <label>peer <select id="peer"><option value="">all</option></select></label>
     <span class="dim" id="counts"></span>
@@ -797,6 +871,16 @@ dialog pre { margin: 0; padding: 12px 14px; font-family: var(--mono); font-size:
   <div class="head"><span class="t" id="dlgt"></span>
     <button id="dlgdiff">Diff</button><button id="dlgclose">Close</button></div>
   <pre id="dlgtext"></pre>
+</dialog>
+<dialog id="plandlg">
+  <div class="head"><span class="t">Auto-import: the plan</span>
+    <button id="plancancel">Cancel</button>
+    <button id="plango" class="primary" disabled>Carry out</button></div>
+  <div class="opts">
+    <label>at most <input type="number" id="plansize" value="8" min="0"> commits a stage</label>
+    <label><input type="checkbox" id="planreview"> also commits listed for review that the agent says to import</label>
+  </div>
+  <div id="plantext"></div>
 </dialog>
 <div id="tip" role="tooltip"></div>
 <script>
@@ -929,6 +1013,12 @@ function help(what, el) {
   const tgt = `<b>${esc(S.target || "the target branch")}</b>`;
   const later = `<p>Nothing happens until you press <b>Apply</b>; press again to unmark.</p>`;
   const tip = {
+    auto: `<p><b>Propose an import plan.</b> diaspora sorts the suggested
+      commits into stages, safest first: those touching none of our files,
+      then those touching files we changed too.</p><p>You see the plan and
+      nothing happens until you press <b>Carry out</b>; then each stage is an
+      import run that must pass <b>${esc(gate())}</b>, and what passes goes to
+      ${tgt} before the next stage starts.</p>`,
     gate: `<p>The test levels an import must pass before it can go to ${tgt},
       in the order they run.</p><p>Click to see each level's commands, what
       counts as passing, and where they run.</p>`,
@@ -1177,7 +1267,7 @@ function renderAll() {
   if (S.agent_cost) st += ` · agent $${S.agent_cost.toFixed(2)}`;
   $("status").textContent = st;
   $("status").className = "status" + (j && j.error ? " err" : "");
-  $("fetch").disabled = $("rescan").disabled = S.busy;
+  $("fetch").disabled = $("rescan").disabled = $("auto").disabled = S.busy;
 }
 
 async function refresh() {
@@ -1271,6 +1361,65 @@ async function showTests() {
 }
 $("where").onclick = e => {
   if (e.target.closest("#gatelink")) { e.preventDefault(); showTests(); }
+};
+// auto-import: show the plan, carry it out only when told
+let plan = null;
+const planOpts = () => ({review: $("planreview").checked,
+                         size: parseInt($("plansize").value || "0", 10) || 0});
+async function showPlan() {
+  plan = null;
+  $("plango").disabled = true;
+  $("plantext").innerHTML = '<p class="dim">working out a plan …</p>';
+  if (!$("plandlg").open) $("plandlg").showModal();
+  const o = planOpts();
+  try {
+    plan = await api(`/api/plan?review=${o.review ? 1 : 0}&size=${o.size}`);
+    renderPlan();
+  } catch (e) { $("plantext").innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+}
+function renderPlan() {
+  const p = plan, n = p.stages.reduce((a, s) => a + s.commits.length, 0);
+  const tgt = `<b>${esc(p.target)}</b>`;
+  let h = "";
+  if (!p.scanned) h += `<p class="dim">The scan has not finished; the plan is of what is read so far.</p>`;
+  h += n ? `<p>${n} commit${n === 1 ? "" : "s"} in ${p.stages.length} stage${
+    p.stages.length === 1 ? "" : "s"}, into ${tgt}.</p>` :
+    `<p>Nothing to import automatically into ${tgt}.</p>`;
+  p.stages.forEach((s, i) => {
+    h += `<h3>Stage ${i + 1}: ${esc(s.title)}</h3><table>` + s.commits.map(c =>
+      `<tr><td class="sha">${esc(c.short)}</td><td>${esc(c.kind)}</td>
+       <td>${esc(c.subject)}${s.kind !== "safe" && c.plan_why ?
+         `<div class="why">${esc(c.plan_why)}</div>` : ""}</td></tr>`).join("") + `</table>`;
+  });
+  if (n) {
+    h += `<h3>How it runs</h3>` + Object.entries(p.levels).map(([peer, lv]) =>
+      `<p>Each commit from ${esc(peer)} must pass <b>${esc(lv.join(" → ") || "no testing")}</b>.</p>`).join("");
+    h += `<p>Each stage is one import run. What passes in it is promoted to ${tgt}
+      before the next stage starts. A commit that fails (its tests, or a
+      conflict the agent cannot resolve) is left out and offered again.</p>
+      <p>The plan stops if the tests cannot run, or fail on ${tgt} without the
+      import: that run then waits above, as any other.</p>`;
+  }
+  if (p.left.length) h += `<h3>Not in the plan</h3><ul>` + p.left.map(l =>
+    `<li>${l.count} ${esc(l.why)}</li>`).join("") + `</ul>`;
+  let stop = "";
+  if (p.running) stop = "A run is waiting above: promote or drop it first.";
+  else if (p.untested) stop = "diaspora.conf requires no testing: no automatic import.";
+  else if (S.busy) stop = `Busy: ${S.job ? S.job.name : "a job"} is running.`;
+  if (stop) h += `<p class="err">${esc(stop)}</p>`;
+  $("plantext").innerHTML = h;
+  $("plango").disabled = !n || !!stop;
+  $("plango").textContent = n ? `Carry out (${n} commit${n === 1 ? "" : "s"})` : "Carry out";
+}
+$("auto").onclick = showPlan;
+$("planreview").onchange = showPlan;
+$("plansize").onchange = showPlan;
+$("plancancel").onclick = () => $("plandlg").close();
+$("plango").onclick = () => {
+  if (!plan) return;
+  const commits = plan.stages.flatMap(s => s.commits.map(c => c.commit));
+  $("plandlg").close();
+  act("/api/auto", Object.assign(planOpts(), {commits}));
 };
 $("fetch").onclick = () => act("/api/scan", {fetch: true});
 $("rescan").onclick = () => act("/api/scan", {fetch: false});

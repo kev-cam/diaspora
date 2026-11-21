@@ -8,6 +8,7 @@ import sys
 import time
 
 from . import __version__, scan, triage
+from . import plan as P
 from . import ledger as L
 from . import tried as T
 from .agent import Agent
@@ -18,7 +19,7 @@ from .ui import UI
 from .userconf import UserConf
 from .workspace import Tester, Workspace
 
-COMMANDS = ("import", "list", "export", "status", "show", "continue", "skip",
+COMMANDS = ("import", "auto", "list", "export", "status", "show", "continue", "skip",
             "abort", "promote", "reject", "defer", "reopen", "withhold",
             "fetch", "log", "test", "init", "gui", "repos", "help")
 
@@ -249,6 +250,49 @@ def cmd_import(repo, ui, args, direction="import"):
         record(repo, conf, ui, agent, target, entries)
     agent_cost(ui, agent)
     return code
+
+
+def cmd_auto(repo, ui, args):
+    """Propose a staged import plan; carry it out when agreed."""
+    conf = Config.load(repo)
+    agent = make_agent(repo, conf, ui, args)
+    target = pick_target(repo, conf, args)
+    running = Session(repo, conf, ui, agent, interactive=False).exists()
+    if running and not args.dry_run:
+        raise DiasporaError(
+            "a diaspora run is in progress (see `diaspora status`): finish "
+            "it first (`diaspora continue`, `promote` or `abort`)")
+    if not conf.has_requirements():
+        raise DiasporaError(
+            "%s requires no testing ([require] default = ...): an automatic "
+            "import would land untested" % CONF_NAME)
+    found = gather(repo, conf, ui, agent, pick_peers(conf, args.peers),
+                   target, args)
+    commits = [c for _peer, got, _dropped in found for c in got]
+    plan = P.propose(repo, conf, target, commits, size=args.stage_size,
+                     review=args.review)
+    ui.say("")
+    for line in P.describe(plan):
+        ui.say(line)
+    ui.say("")
+    if not plan.stages or args.dry_run:
+        if running:
+            ui.say("(A run is in progress: it has to be finished before a "
+                   "plan can be carried out.)")
+        agent_cost(ui, agent)
+        return 0
+    if not args.yes:
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            ui.say("Not a terminal: `diaspora auto --yes` carries it out.")
+            return 0
+        if not ui.confirm("Carry out this plan?", default=False):
+            ui.say("Nothing imported.")
+            agent_cost(ui, agent)
+            return 0
+    status, _done = P.carry_out(repo, conf, ui, agent, plan,
+                                verbose=args.verbose)
+    agent_cost(ui, agent)
+    return 0 if status == "done" else 3
 
 
 def cmd_export(repo, ui, args):
@@ -758,6 +802,20 @@ def build_parser():
                        "apply, test, copy to the target branch (default)")
     scanning(p)
     p.set_defaults(func=cmd_import)
+    p = sub.add_parser("auto", help="propose a staged import plan (the "
+                       "safest commits first), and carry it out if you agree")
+    scanning(p, picks=False)
+    p.add_argument("-y", "--yes", action="store_true",
+                   help="carry the plan out without asking")
+    p.add_argument("-n", "--dry-run", action="store_true",
+                   help="show the plan and stop")
+    p.add_argument("--stage-size", type=int, default=8, metavar="N",
+                   help="at most N commits per stage (0: no limit; "
+                        "default 8)")
+    p.add_argument("--review", action="store_true",
+                   help="also plan commits listed for review that the "
+                        "agent says to import")
+    p.set_defaults(func=cmd_auto)
     p = sub.add_parser("list", help="list candidate imports and stop")
     scanning(p, picks=False)
     p.add_argument("--json", action="store_true", help="machine-readable")

@@ -1108,6 +1108,111 @@ class TerminalTests(World):
         self.assertNotIn("return 2", self.read("src/a.c"))
 
 
+class AutoTests(World):
+    """diaspora auto: a staged plan, carried out when agreed."""
+
+    def plan(self, **kw):
+        from diaspora import plan as P
+        found, _ = self.candidates()
+        repo = Repo(self.ours)
+        return found, P.propose(repo, Config.load(repo), "main",
+                                list(found.values()), **kw)
+
+    def test_the_plan(self):
+        _found, plan = self.plan()
+        self.assertEqual([(s.kind, [c.sha for c in s.commits])
+                          for s in plan.stages],
+                         [("safe", [self.p1, self.p5]), ("ours", [self.p4])])
+        self.assertEqual(plan.why[self.p4], "touches src/b.c")
+        left = {why: [c.sha for c in cs] for why, cs in plan.left.items()}
+        self.assertEqual(left["ignored by policy"], [self.p2])
+        self.assertEqual(
+            left["to review (not a kind imported by default)"], [self.p3])
+        self.assertEqual(plan.levels, {"up": ["compile", "regress"]})
+        _found, plan = self.plan(size=1)
+        self.assertEqual([len(s.commits) for s in plan.stages], [1, 1, 1])
+        self.assertEqual(plan.stages[1].title,
+                         "suggested, touching none of our files (2 of 2)")
+
+    def test_what_a_commit_needs_comes_first(self):
+        from diaspora import plan as P
+        found, _ = self.candidates()
+        repo = Repo(self.ours)
+        found[self.p1].depends = [self.p4[:10]]
+        plan = P.propose(repo, Config.load(repo), "main",
+                         list(found.values()))
+        self.assertEqual([c.sha for c in plan.stages[1].commits],
+                         [self.p1, self.p4])
+        self.assertEqual(plan.why[self.p1], "needs %s" % self.p4[:10])
+        found[self.p1].depends = [self.p3[:10]]       # left for review
+        plan = P.propose(repo, Config.load(repo), "main",
+                         list(found.values()))
+        self.assertNotIn(self.p1, [c.sha for c in plan.commits])
+        self.assertIn("needs %s, which is not in the plan" % self.p3[:10],
+                      plan.left)
+
+    def test_failed_and_tried_stay_out(self):
+        self.run_cli("import", "--no-agent", "--yes", "--pick", self.p5,
+                     code=4)
+        _found, plan = self.plan()
+        self.assertNotIn(self.p5, [c.sha for c in plan.commits])
+        self.assertIn("failed before (needs Retry)", plan.left)
+
+    def test_auto_shows_the_plan_and_waits(self):
+        before = git(self.ours, "rev-parse", "main")
+        out = self.run_cli("auto", "--no-agent", code=0)
+        self.assertIn("Import plan for main: 3 commits in 2 stages.", out)
+        self.assertIn("Stage 2: suggested, touching files we changed too",
+                      out)
+        self.assertIn("touches src/b.c", out)
+        self.assertIn("Not a terminal: `diaspora auto --yes`", out)
+        out = self.run_cli("auto", "--no-agent", "--dry-run", code=0)
+        self.assertNotIn("Not a terminal", out)
+        self.assertEqual(git(self.ours, "rev-parse", "main"), before)
+
+    def test_auto_carries_it_out_stage_by_stage(self):
+        self.use_fake_agent()
+        os.environ["FAKE_TRIAGE"] = json.dumps({
+            "Add x": {"kind": "feature", "recommend": "review"}})
+        os.environ["FAKE_FIX"] = "sed -i s/BREAK/fine/ src/c.c"
+        out = self.run_cli("auto", "--yes", code=0)
+        self.assertIn("== Stage 1 of 2", out)
+        self.assertIn("== Stage 2 of 2", out)
+        self.assertIn("The plan is carried out: 2 stages.", out)
+        ledger = self.ledger()
+        self.assertEqual(ledger[self.p1]["verdict"], "applied")
+        self.assertEqual(ledger[self.p5]["verdict"], "adapted")
+        self.assertEqual(ledger[self.p4]["verdict"], "adapted")
+        self.assertNotIn(self.p3, ledger)
+        # stage 1 went to main before stage 2 began
+        subjects = git(self.ours, "log", "--format=%s", "main").splitlines()
+        self.assertEqual(subjects[:6], [
+            "diaspora: 1 adapted", "Fix overflow in b",
+            "diaspora: 1 adapted, 1 applied", "Fix typo handling in c",
+            "Fix crash in a when called twice", "Add diaspora.conf"])
+
+    def test_without_an_agent_a_conflict_fails(self):
+        self.run_cli("auto", "--no-agent", "--yes", code=0)
+        ledger = self.ledger()
+        self.assertEqual(ledger[self.p1]["verdict"], "applied")
+        self.assertEqual(ledger[self.p5]["verdict"], "failed")
+        self.assertEqual(ledger[self.p4]["verdict"], "failed")
+        self.assertIn("return 2", self.read("src/a.c"))
+
+    def test_auto_stops_where_a_run_waits(self):
+        self.commit(self.ours, "Break the regression on purpose", {
+            "src/broken.c": "BREAK\n"})
+        tip = git(self.ours, "rev-parse", "main")
+        self.run_cli("auto", "--no-agent", "--yes", code=3)
+        self.assertIn("The plan stops at stage 1 of 2: the run is blocked. "
+                      "1 stage not started", self.last_err)
+        self.assertEqual(git(self.ours, "rev-parse", "main"), tip)
+        self.run_cli("auto", "--no-agent", "--yes", code=1)
+        self.assertIn("a diaspora run is in progress", self.last_err)
+        self.assertIn("A run is in progress",
+                      self.run_cli("auto", "--no-agent", "--dry-run", code=0))
+
+
 class GuiTests(World):
     """The browser page's server, driven over HTTP as the page drives it."""
 
@@ -1182,6 +1287,38 @@ class GuiTests(World):
         page = self.call("/")[1]
         self.assertIn("touches ours", page)
         self.assertIn("no overlap", page)
+
+    def test_auto_import(self):
+        code, plan = self.call("/api/plan")
+        self.assertEqual(code, 200, plan)
+        self.assertEqual([[c["commit"] for c in s["commits"]]
+                          for s in plan["stages"]],
+                         [[self.p1, self.p5], [self.p4]])
+        self.assertFalse(plan["running"])
+        shown = [self.p1, self.p5, self.p4]
+        code, out = self.call("/api/auto", {"commits": shown[:2]})
+        self.app.wait()
+        self.assertIn("changed since the plan was shown", self.app.job["error"])
+        # no agent: p5 fails its tests, p4 conflicts; both are left out
+        self.post("/api/auto", {"commits": shown, "size": 8})
+        self.assertIn("return 2", self.read("src/a.c"))
+        ledger = self.ledger()
+        self.assertEqual(ledger[self.p4]["verdict"], "failed")
+        self.assertIsNone(self.state()["run"])
+        self.assertIn('id="auto"', self.call("/")[1])
+
+    def test_auto_import_stops_on_a_blocked_run(self):
+        self.commit(self.ours, "Break the regression on purpose", {
+            "src/broken.c": "BREAK\n"})
+        self.post("/api/scan", {"fetch": False})
+        plan = self.call("/api/plan")[1]
+        shown = [c["commit"] for s in plan["stages"] for c in s["commits"]]
+        self.call("/api/auto", {"commits": shown, "size": 8})
+        self.app.wait()
+        self.assertIn("stopped at stage 1 of 2: the run is blocked",
+                      self.app.job["error"])
+        self.assertTrue(self.call("/api/plan")[1]["running"])
+        self.assertEqual(self.call("/api/auto", {"commits": shown})[0], 400)
 
     def test_what_is_tested(self):
         with open(os.path.join(self.ours, "diaspora.conf"), "a") as handle:

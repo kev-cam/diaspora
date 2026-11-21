@@ -448,6 +448,7 @@ has been offered so it is not offered twice.
 | | |
 |---|---|
 | `diaspora` / `diaspora import [peer...]` | list, pick, import, test, promote |
+| `diaspora auto [peer...]` | propose a staged import plan, carry it out if you agree (below) |
 | `diaspora list [peer...]` | list only; `--json`, `--all`, `--max N` |
 | `diaspora export <peer>` | prepare a branch of our commits for a peer |
 | `diaspora status` | peers, ledger counts, the run in progress |
@@ -465,6 +466,40 @@ without asking), `--pick <commit>`, `--no-agent`, `--no-fetch`,
 `--strategy batch`, `--no-promote`, `--target <branch>`, `--here` (import
 into the branch you are on, whatever `target` says), `-v` (show test
 output as it runs).
+
+## Auto-import: `diaspora auto`
+
+`diaspora auto` scans as `import` does, then proposes a plan instead of a
+pick list: the commits it would suggest anyway, in stages, safest first.
+
+1. suggested commits that touch none of our own files;
+2. suggested commits that touch files we changed too (or whose overlap
+   is not known, or that the agent calls high-risk);
+3. with `--review`, commits listed for review that the agent says to
+   import.
+
+A commit goes no earlier than one it needs (the agent's `depends`), and
+is left out when what it needs is. A stage holds at most `--stage-size`
+commits (default 8; `0`, no limit), split evenly. Commits that failed
+before or were tried and did not work are never in a plan (they need a
+Retry, with someone looking), nor are deferred, ignored or ones in a run
+in progress; the plan says how many of each it left out.
+
+Nothing happens until you agree (`Carry out this plan? [y/N]`; `--yes`
+agrees in advance, `--dry-run` only shows it). Then each stage is an
+ordinary import run: each commit applied (ported by the agent if it does
+not apply) and tested at the levels it requires; what passes is promoted to
+the target before the next stage starts, so a later, riskier stage can
+never hold back an earlier one. A commit that fails is left out and offered
+again. The plan stops if a run cannot go on by itself (the tests cannot
+run, or fail on the target without the import); the run then waits as any
+other, and once it is finished `diaspora auto` proposes what is left.
+
+In the page, **Auto-import…** shows the same plan in a dialog (stage size
+and the review stage can be changed there); **Carry out** runs it as one
+job, stage by stage, and the run panel shows the stage in progress. The
+page carries out only the plan it showed: if the candidates changed in the
+meantime it says so and asks you to look again.
 
 ## Your repositories: `~/.config/diaspora`
 
